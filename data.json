@@ -1,0 +1,55 @@
+{
+    "session": "1BJWap1sAUE2xo41tuUiK1hdUBdtiU1--cY83zvh_7I1y0udo4HOh8yVNfDl4pmO7hoofTZTqZ7Tu_kmDfxl-YvYuqNPDUSHt0Io5Soafejk5XGss1pHMrxPbhDSoz537Xx0vwFYmVSUuPmjIF9S1YPoJ_OPzb814nJYvONL_bP5zNT8gWrDTVSWZefF-q545990SGN9NniNkmJohqz_b3uRFg934GFf765qihnerl-XmWpX3s--ZTlDsRFg9zke4l9fVEvw7VXFXDGGe3Sc6B9Ea_FKcGPnA_HG7d0c_MIyX9CX2ZFg4Vq83bwN19R5Eipr9DKkgzaIrRc1ek7wl_VdV2X83vTc=",
+    "keywords": [],
+    "replies": [],
+    "running": false,
+    "log_channel": -1003668311132,
+    "typing_delay": 2,
+    "work_start": 0,
+    "work_end": 23,
+    "work_mode": false,
+    "reaction_mode": false,
+    "reaction_emoji": "❤️",
+    "spy_mode": true,
+    "ghost_mode": true,
+    "auto_bio": false,
+    "bio_template": "Time: %TIME% | Status: Online",
+    "store_name": "red bull",
+    "store_user": null,
+    "has_logo": false,
+    "invoices_archive": {
+        "7117987054537416": {
+            "client_name": "23",
+            "product": "chat",
+            "count": "1",
+            "price": "3$"
+        },
+        "1646774324727680": {
+            "client_name": "23",
+            "product": "chat",
+            "count": "1",
+            "price": "33$"
+        },
+        "5942143454229487": {
+            "client_name": "23",
+            "product": "chat",
+            "count": "2",
+            "price": "4$"
+        },
+        "3572330512020109": {
+            "client_name": "23",
+            "product": "chat",
+            "count": "3",
+            "price": "4$",
+            "warranty": "30"
+        }
+    },
+    "fake_offline": false,
+    "anti_typing": false,
+    "freeze_last_seen": false,
+    "screenshot_detect": false,
+    "anti_link_group": false,
+    "auto_save_destruct": true,
+    "stalk_list": [],
+    "typing_watch_list": []
+}

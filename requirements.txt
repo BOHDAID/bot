@@ -1,0 +1,8 @@
+telethon
+pymongo
+certifi
+fpdf
+arabic-reshaper
+python-bidi
+requests
+aiohttp
