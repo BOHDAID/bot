@@ -20,8 +20,8 @@ from aiohttp import web
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 # --- استدعاء المتغيرات من النظام (السرية) ---
-API_ID = int(os.getenv("API_ID")  # سيقرأ القيمة من الـ Secrets
-API_HASH = os.getenv("API_HASH")
+API_ID = 6
+API_HASH = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 # --- قاعدة البيانات والذكاء الاصطناعي ---
@@ -543,5 +543,6 @@ if __name__ == '__main__':
         loop = asyncio.get_event_loop()
         loop.run_until_complete(main())
     except KeyboardInterrupt: pass
+
 
 
