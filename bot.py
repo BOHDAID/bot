@@ -1,428 +1,519 @@
-# ==============================================================================
-# 🤖 TELEGRAM USERBOT - SINGLE USER (RENDER + MONGODB FIXED)
-# ==============================================================================
-
-import asyncio
-import json
 import os
-import time
-import random
-import datetime
-import requests
-import traceback
-import zipfile
-import io
 import sys
-import warnings
+import asyncio
 import logging
-import pymongo
-import certifi
-from aiohttp import web
-from fpdf import FPDF
-import arabic_reshaper
-from bidi.algorithm import get_display
-from telethon import TelegramClient, events, Button, functions, types
+import time
+import re
+import aiohttp
+from dotenv import load_dotenv
+from openai import AsyncOpenAI 
+from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import CreateChannelRequest, EditBannedRequest, InviteToChannelRequest, GetParticipantsRequest, JoinChannelRequest
-from telethon.tl.functions.messages import SendReactionRequest, SetTypingRequest, ReadHistoryRequest, DeleteHistoryRequest
-from telethon.tl.functions.account import UpdateProfileRequest, UpdateStatusRequest
-from telethon.tl.functions.users import GetFullUserRequest
-from telethon.tl.types import SendMessageCancelAction, ChannelParticipantsAdmins, UserStatusOnline, UserStatusOffline, UserStatusRecently
-from telethon.errors import MessageNotModifiedError, FloodWaitError
+from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.types import User
+from motor.motor_asyncio import AsyncIOMotorClient
+from aiohttp import web
 
-# --- إعدادات النظام ---
-warnings.filterwarnings("ignore")
-logging.basicConfig(level=logging.INFO)
+# تحميل البيانات من ملف .env (تأكد من وضع بياناتك فيه)
+load_dotenv()
 
-# --- المتغيرات (من Render Environment) ---
-# يتم سحب البيانات من إعدادات الموقع
-API_ID = int(os.environ.get("API_ID", 6))
-API_HASH = os.environ.get("API_HASH", "eb06d4abfb49dc3eeb1aeb98ae0f581e")
-BOT_TOKEN = os.environ.get("BOT_TOKEN") 
-MONGO_URI = os.environ.get("MONGO_URI")
+# ==========================================
+#      1. الإعدادات والتهيئة
+# ==========================================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-LOGO_FILE = "saved_store_logo.jpg"
-FONT_FILE = "font.ttf"
-FONT_URL = "https://github.com/google/fonts/raw/main/ofl/amiri/Amiri-Regular.ttf"
+# جلب البيانات من ملف البيئة
+API_ID = int(os.getenv("API_ID", 0))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+MONGO_URI = os.getenv("MONGO_URI", "")
+MY_LTC_ADDRESS = os.getenv("MY_LTC_ADDRESS", "")
+SAMBANOVA_API_KEY = os.getenv("SAMBANOVA_API_KEY", "")
 
-# --- الاتصال بقاعدة البيانات (MongoDB) ---
-mongo_client = None
-db = None
-settings_collection = None
-
-print("⏳ جاري الاتصال بقاعدة البيانات...")
+# إعداد العميل الذكي
 try:
-    if MONGO_URI:
-        mongo_client = pymongo.MongoClient(MONGO_URI, tlsCAFile=certifi.where())
-        db = mongo_client["telegram_userbot_db"]
-        settings_collection = db["settings"]
-        print("✅ تم الاتصال بقاعدة البيانات بنجاح!")
-    else:
-        print("⚠️ تحذير: لم يتم وضع رابط MONGO_URI في الإعدادات.")
+    ai_client = AsyncOpenAI(
+        base_url="https://api.sambanova.ai/v1",
+        api_key=SAMBANOVA_API_KEY
+    )
+    AI_MODEL = "Meta-Llama-3.1-405B-Instruct"
+    print(f"✅ تم تفعيل الوحش: {AI_MODEL}")
 except Exception as e:
-    print(f"❌ خطأ في الاتصال بقاعدة البيانات: {e}")
+    print(f"❌ خطأ في الإعداد: {e}")
 
-# --- تحميل الخط ---
-if not os.path.exists(FONT_FILE) or os.path.getsize(FONT_FILE) < 1000:
-    try:
-        r = requests.get(FONT_URL)
-        with open(FONT_FILE, 'wb') as f: f.write(r.content)
-    except: pass
+# القاعدة الصارمة للبوت أثناء الرد على العملاء
+STRICT_RULE = """
+تعليمات النظام (System Prompt):
+أنت تاجر سعودي محترف، ولست ذكاءً اصطناعياً.
+1. تحدث بلهجة سعودية طبيعية جداً.
+2. لا تستخدم الفصحى المقعرة ولا تعتذر كثيراً.
+3. هدفك البيع وخدمة العميل بناءً على المعلومات المتوفرة.
+4. إذا لم تتوفر معلومة، اطلبها من العميل بذكاء.
+"""
 
-# --- تشغيل العميل ---
-bot = None
+active_clients = {}      
+USER_STATE = {}          
+TASK_DATA = {}           
+AI_CONTEXT = {} # ذاكرة النقاش
+
+# ==========================================
+#      2. قاعدة البيانات
+# ==========================================
 try:
-    bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
-except:
-    bot = TelegramClient('bot_session', API_ID, API_HASH)
+    mongo_client = AsyncIOMotorClient(MONGO_URI)
+    db = mongo_client['MyTelegramBotDB']
+    sessions_col = db['sessions']       
+    replies_col = db['replies']         
+    subs_col = db['subscriptions']      
+    ai_settings_col = db['ai_prompts']  
+    print("✅ DB Connected")
+except: sys.exit(1)
 
-user_client = None
-bio_task = None
+# ==========================================
+#      3. البوت والخادم
+# ==========================================
+bot = TelegramClient('bot_session', API_ID, API_HASH)
 
-# --- الإعدادات الافتراضية ---
-default_settings = {
-    "_id": "bot_config", "session": None, "running": False, "log_channel": None,
-    "spy_mode": False, "ghost_mode": False, "anti_typing": False, "fake_offline": False,
-    "keywords": [], "replies": [], "typing_delay": 2, "work_mode": False,
-    "work_start": 0, "work_end": 23,
-    "store_name": "My Store", "store_user": "@Store", "invoices_archive": {},
-    "auto_bio": False, "bio_template": "Time: %TIME% | Online",
-    "stalk_list": [], "typing_watch_list": [],
-    "anti_link_group": False, "auto_save_destruct": True,
-    "reaction_mode": False, "reaction_emoji": "❤️"
-}
+async def web_handler(request):
+    return web.Response(text=f"Bot Running. Users: {len(active_clients)}")
 
-settings = default_settings.copy()
-user_cooldowns = {}
-user_state = {}
-invoice_drafts = {}
-temp_scan_data = {}
-message_cache = {}
-active_relay_config = {}
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', web_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    await site.start()
 
-# --- دوال البيانات (تم التعديل لتدعم Mongo) ---
-def save_data():
-    if settings_collection is None: return
+# ==========================================
+#      4. محرك الذكاء (للحوار والنقاش)
+# ==========================================
+async def ask_smart_ai(messages_history):
     try:
-        settings_collection.replace_one({"_id": "bot_config"}, settings, upsert=True)
+        response = await ai_client.chat.completions.create(
+            model=AI_MODEL,
+            messages=messages_history,
+            temperature=0.7, 
+            top_p=0.9
+        )
+        return response.choices[0].message.content
     except Exception as e:
-        print(f"Error saving: {e}")
+        print(f"❌ AI Error: {e}")
+        return None
 
-def load_data():
-    global settings
-    if settings_collection is None: return
+# ==========================================
+#      🕵️‍♂️ المحلل الشخصي
+# ==========================================
+async def perform_ultimate_analysis(client, owner_id, status_msg):
     try:
-        data = settings_collection.find_one({"_id": "bot_config"})
-        if data:
-            for k in data: settings[k] = data[k]
-            print("☁️ تم تحميل البيانات.")
-        else:
-            save_data()
+        me = await client.get_me()
+        await status_msg.edit("📦 **جاري سحب البيانات...**")
         
-        # ضمان وجود القوائم
-        if "keywords" not in settings: settings["keywords"] = []
-        if "replies" not in settings: settings["replies"] = []
-        if "invoices_archive" not in settings: settings["invoices_archive"] = {}
-    except: pass
-
-def is_working_hour():
-    if not settings["work_mode"]: return True
-    h = datetime.datetime.now().hour
-    return settings["work_start"] <= h < settings["work_end"]
-
-# --- نظام الفواتير ---
-def fix_text(text):
-    if not text: return ""
-    try: return get_display(arabic_reshaper.reshape(str(text)))
-    except: return str(text)
-
-def create_arabic_invoice(data, code_16, output_filename):
-    try:
-        pdf = FPDF()
-        pdf.add_page()
-        is_ar = False
-        if os.path.exists(FONT_FILE):
-            pdf.add_font('Amiri', '', FONT_FILE, uni=True)
-            is_ar = True
+        collected_data = ""
+        count = 0
+        async for dialog in client.iter_dialogs(limit=20):
+            if count > 10000: break 
+            if dialog.is_user and not dialog.entity.bot:
+                async for msg in client.iter_messages(dialog.id, limit=5):
+                    if msg.out and msg.text:
+                        collected_data += f"- {msg.text}\n"
+                        count += len(msg.text)
         
-        pdf.set_font('Amiri' if is_ar else 'Helvetica', '', 12)
-        def t(a, e): return fix_text(str(a)) if is_ar else str(e)
-
-        # Header
-        pdf.set_fill_color(100, 50, 150); pdf.rect(0, 0, 210, 45, 'F')
-        if os.path.exists(LOGO_FILE):
-            pdf.image(LOGO_FILE, x=95, y=5, w=25)
+        await status_msg.edit("🧠 **المارد (405B) يحلل شخصيتك...**")
         
-        pdf.set_text_color(255, 255, 255); pdf.set_font_size(26); pdf.set_xy(0, 32)
-        pdf.cell(210, 10, text=t("INVOICE / فاتورة", "INVOICE"), ln=True, align='C')
-        pdf.ln(15)
-
-        # Ref
-        pdf.set_text_color(0, 0, 0); pdf.set_font_size(12)
-        pdf.cell(0, 10, text=str(f"Ref: {code_16}"), ln=True, align='C'); pdf.ln(8)
-
-        # Details
-        store_name = settings.get("store_name", "Store")
-        client_name = data.get('client_name', 'Client')
-        date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-
-        pdf.set_fill_color(240, 240, 240); pdf.set_font_size(16)
-        pdf.cell(190, 12, text=t("تفاصيل الفاتورة", "Details"), ln=True, align='R' if is_ar else 'L', fill=True)
-        
-        pdf.set_font_size(14)
-        align = 'R' if is_ar else 'L'
-        pdf.cell(190, 9, text=t(f"المتجر: {store_name}", f"Store: {store_name}"), ln=True, align=align)
-        pdf.cell(190, 9, text=t(f"العميل: {client_name}", f"Client: {client_name}"), ln=True, align=align)
-        pdf.cell(190, 9, text=t(f"التاريخ: {date_str}", f"Date: {date_str}"), ln=True, align=align)
-        pdf.ln(12)
-
-        # Table
-        pdf.set_fill_color(100, 50, 150); pdf.set_text_color(255, 255, 255); pdf.set_font_size(14)
-        cols = ["السعر", "الضمان", "العدد", "المنتج"]
-        w = [35, 45, 25, 85]
-        
-        if is_ar:
-            for i in range(4): pdf.cell(w[i], 12, text=t(cols[i], ""), border=1, align='C', fill=True)
-        else:
-            for i in reversed(range(4)): pdf.cell(w[i], 12, text=cols[i], border=1, align='C', fill=True)
-        pdf.ln()
-
-        pdf.set_text_color(0, 0, 0)
-        vals = [
-            str(data.get('price', '0')),
-            str(data.get('warranty', '-')),
-            str(data.get('count', '1')),
-            str(data.get('product', 'Item'))
+        analysis_msgs = [
+            {"role": "system", "content": "أنت خبير تحليل بيانات."},
+            {"role": "user", "content": f"حلل هذه الرسائل لتاجر واستخرج المنتجات والأسعار والأسلوب، واكتب System Prompt شامل:\n{collected_data[:5000]}"}
         ]
         
-        if is_ar:
-            for i in range(4): pdf.cell(w[i], 14, text=t(vals[i], ""), border=1, align='C')
-        else:
-            for i in reversed(range(4)): pdf.cell(w[i], 14, text=vals[i], border=1, align='C')
-        pdf.ln(25)
-
-        # Total
-        pdf.set_font_size(18); pdf.set_text_color(0, 128, 0)
-        pdf.cell(0, 12, text=t(f"الإجمالي: {vals[0]}", f"Total: {vals[0]}"), ln=True, align='C')
+        final_res = await ask_smart_ai(analysis_msgs)
         
-        pdf.output(output_filename)
-        return True
-    except Exception as e:
-        print(f"PDF Error: {e}")
-        return False# --- الوظائف الخلفية ---
-async def bio_loop():
-    print("✅ Bio Service Started")
-    while True:
-        if settings["auto_bio"] and user_client:
+        if final_res:
+            await ai_settings_col.update_one({"owner_id": owner_id}, {"$set": {"prompt": final_res}}, upsert=True)
             try:
-                now = datetime.datetime.now().strftime("%I:%M %p")
-                bt = settings["bio_template"].replace("%TIME%", now)
-                await user_client(UpdateProfileRequest(about=bt))
-            except: pass
-        await asyncio.sleep(60)
+                await client.send_message("me", f"📝 **تقرير التحليل:**\n\n{final_res}")
+            except:
+                with open("report.txt", "w", encoding="utf-8") as f: f.write(final_res)
+                await client.send_file("me", "report.txt", caption="📝 **التقرير**")
 
-async def get_log_channel_entity():
-    if not settings["log_channel"]: return None
-    try: return await user_client.get_entity(settings["log_channel"])
-    except: return None
+            return "✅ **تم الاستنساخ بذكاء 405B!**"
+        else: return "❌ فشل التحليل."
 
-# --- المعالجات (Handlers) ---
-async def message_edited_handler(event):
-    if not settings["spy_mode"] or not event.is_private: return
-    try:
-        log = await get_log_channel_entity()
-        if log:
-            s = await event.get_sender()
-            n = getattr(s, 'first_name', 'Unknown')
-            await user_client.send_message(log, f"✏️ **تعديل (خاص)**\n👤: {n}\n📝: `{event.raw_text}`")
-    except: pass
-
-async def message_deleted_handler(event):
-    if not settings["spy_mode"]: return
-    try:
-        log = await get_log_channel_entity()
-        if log:
-            for m in event.deleted_ids:
-                if m in message_cache:
-                    d = message_cache[m]
-                    if d.get('is_private'):
-                        await user_client.send_message(log, f"🗑️ **حذف (خاص)**\n👤: {d['sender']}\n📝: `{d['text']}`")
-    except: pass
-
-async def global_reply_handler(event):
-    # Ghost Logic (Read in background)
-    if settings["ghost_mode"] and event.is_private and not event.out:
-        try:
-            log = await get_log_channel_entity()
-            if log:
-                await event.forward_to(log)
-                s = await event.get_sender()
-                n = getattr(s, 'first_name', 'Unknown')
-                await user_client.send_message(log, f"👻 **شبح: رسالة من {n}**")
-        except: pass
-
-    # Auto Reply Logic
-    if not settings["running"] or not settings["keywords"] or not settings["replies"]: return
-    if event.out or not is_working_hour(): return
-
-    text = event.raw_text.strip()
-    if any(k in text for k in settings["keywords"]):
-        sid = event.sender_id
-        if sid in user_cooldowns:
-            if time.time() - user_cooldowns[sid] < 600: return # 10 mins cooldown
-        
-        try:
-            async with user_client.action(event.chat_id, 'typing'):
-                await asyncio.sleep(settings["typing_delay"])
-                await event.reply(random.choice(settings["replies"]))
-            user_cooldowns[sid] = time.time()
-        except: pass
-
-async def cache_messages_handler(event):
-    try:
-        if event.is_private:
-            s = await event.get_sender()
-            n = getattr(s, 'first_name', 'Unknown')
-            message_cache[event.id] = {"text": event.raw_text, "sender": n, "is_private": True}
-            if len(message_cache) > 500:
-                keys = list(message_cache.keys())
-                for k in keys[:100]: del message_cache[k]
-    except: pass
-
-# --- تشغيل البوت ---
-async def start_user_bot():
-    global user_client, bio_task
-    if not settings["session"]: return
-    try:
-        if user_client: await user_client.disconnect()
-        user_client = TelegramClient(StringSession(settings["session"]), API_ID, API_HASH)
-        await user_client.connect()
-        
-        user_client.add_event_handler(global_reply_handler, events.NewMessage())
-        user_client.add_event_handler(message_edited_handler, events.MessageEdited())
-        user_client.add_event_handler(message_deleted_handler, events.MessageDeleted())
-        user_client.add_event_handler(cache_messages_handler, events.NewMessage())
-        
-        if bio_task: bio_task.cancel()
-        bio_task = asyncio.create_task(bio_loop())
-        print("✅ Userbot Active")
     except Exception as e:
-        print(f"❌ Start Error: {e}")
+        return f"خطأ: {e}"
 
-# --- واجهات المستخدم ---
-async def show_invoice_menu(event):
-    btns = [
-        [Button.inline("➕ فاتورة جديدة", b"start_fast_invoice"), Button.inline("⚙️ إعداد المتجر", b"store_settings")],
-        [Button.inline("🔙 رجوع", b"refresh_panel")]
-    ]
-    try: await event.edit("🧾 **نظام الفواتير**", buttons=btns)
-    except: await event.respond("🧾 **نظام الفواتير**", buttons=btns)
+# ==========================================
+#      5. فحص LTC
+# ==========================================
+async def verify_ltc(tx_hash):
+    try:
+        tx_hash = re.sub(r'[^a-fA-F0-9]', '', tx_hash)
+        if len(tx_hash) < 10: return False, "هاش خطأ"
+        url = f"https://api.blockcypher.com/v1/ltc/main/txs/{tx_hash}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as response:
+                if response.status != 200: return False, "غير موجود"
+                data = await response.json()
+        found = False
+        val = 0.0
+        for out in data.get("outputs", []):
+            if MY_LTC_ADDRESS in out.get("addresses", []):
+                val = out.get("value", 0) / 100000000.0
+                found = True
+                break
+        if found: return True, f"{val} LTC"
+        else: return False, "لم تصلك"
+    except: return False, "خطأ شبكة"
 
-async def show_control_panel(event, edit=False):
-    st = "🟢 يعمل" if settings["running"] else "🔴 متوقف"
-    msg = f"🎛️ **لوحة التحكم**\n📡 الحالة: {st}\n👮 تجسس: {'✅' if settings['spy_mode'] else '❌'}\n👻 شبح: {'✅' if settings['ghost_mode'] else '❌'}"
-    
-    btns = [
-        [Button.inline("🛠️ الأدوات", b"tools_menu"), Button.inline("🧾 الفواتير", b"invoice_menu")],
-        [Button.inline("💬 الردود", b"manage_kw_menu"), Button.inline("🕵️ التجسس", b"toggle_spy")],
-        [Button.inline("👻 الشبح", b"toggle_ghost"), Button.inline("📝 البايو", b"toggle_bio")],
-        [Button.inline(f"تشغيل/إيقاف {st}", b"toggle_run"), Button.inline("📢 السجل", b"log_settings")],
-        [Button.inline("🔄 تحديث", b"refresh_panel"), Button.inline("❌ خروج", b"logout")]
-    ]
-    if edit: 
-        try: await event.edit(msg, buttons=btns)
-        except: await event.respond(msg, buttons=btns)
-    else: await event.respond(msg, buttons=btns)
+# ==========================================
+#      6. تشغيل اليوزربوت
+# ==========================================
+async def start_userbot(owner_id, session_str):
+    try:
+        if owner_id in active_clients: await active_clients[owner_id].disconnect()
+        client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+        await client.connect()
+        if not await client.is_user_authorized():
+            await sessions_col.delete_one({"_id": owner_id})
+            return False
+        client.owner_id = owner_id
+        client.cooldowns = {} 
+        client.add_event_handler(lambda e: userbot_incoming_handler(client, e), events.NewMessage(incoming=True))
+        client.add_event_handler(lambda e: forced_sub_handler(client, e), events.NewMessage(incoming=True))
+        active_clients[owner_id] = client
+        return True
+    except: return False
 
-# --- القوائم الفرعية ---
-async def show_tools_menu(event):
-    btns = [[Button.inline("📥 تحميل", b"tool_dl"), Button.inline("🌐 IP", b"tool_ip")], [Button.inline("🔙", b"refresh_panel")]]
-    await event.edit("🛠️ **الأدوات:**", buttons=btns)
+async def load_all_sessions():
+    async for doc in sessions_col.find({}):
+        asyncio.create_task(start_userbot(doc['_id'], doc['session_string']))
 
-async def show_keywords_main_menu(event):
-    k=len(settings["keywords"]); r=len(settings["replies"])
-    btns = [
-        [Button.inline(f"الكلمات ({k})", b"list_kw"), Button.inline(f"الردود ({r})", b"list_rep")],
-        [Button.inline("➕ كلمة", b"add_word"), Button.inline("➕ رد", b"add_reply")],
-        [Button.inline("🔙", b"refresh_panel")]
-    ]
-    await event.edit("🔠 **إدارة الردود:**", buttons=btns)
+# ==========================================
+#      7. المعالجات
+# ==========================================
+async def userbot_incoming_handler(client, event):
+    if not event.is_private: return 
+    try:
+        owner_id = client.owner_id
+        settings = await ai_settings_col.find_one({"owner_id": owner_id})
+        is_ai_active = settings.get('active', False) if settings else False
+        
+        text = event.raw_text or ""
+        has_img = bool(event.message.photo)
 
-# --- الكالباك ---
+        if has_img:
+            try:
+                sender = await event.get_sender()
+                await client.send_message("me", f"📸 **إثبات من:** {sender.first_name}", file=event.message.photo)
+            except: pass
+
+        if not text and not has_img: return
+
+        cursor = replies_col.find({"owner_id": owner_id})
+        async for d in cursor:
+            if d['keyword'] in text:
+                await event.reply(d['reply'])
+                return 
+
+        if not is_ai_active: return 
+
+        current_time = time.time()
+        if current_time - client.cooldowns.get(event.chat_id, 0) > 5: 
+            try:
+                async with client.action(event.chat_id, 'typing'): await asyncio.sleep(1.5)
+            except: pass
+
+            pay_info = ""
+            hm = re.search(r'\b[a-fA-F0-9]{64}\b', text)
+            if hm:
+                v, i = await verify_ltc(hm.group(0))
+                pay_info = f"\n[النظام: العميل أرسل إشعار دفع نتيجته: {'تم' if v else 'فشل'} مبلغ {i}]"
+            elif has_img: pay_info = "\n[النظام: العميل أرسل صورة]"
+
+            saved_persona = settings.get('prompt', "أنت تاجر.") if settings else "أنت تاجر."
+            
+            msgs = [
+                {"role": "system", "content": f"{STRICT_RULE}\n\nبياناتك وشخصيتك:\n{saved_persona}\n{pay_info}"},
+                {"role": "user", "content": text if text else "صورة"}
+            ]
+            
+            ai_reply = await ask_smart_ai(msgs)
+            
+            if ai_reply: await event.reply(ai_reply)
+            client.cooldowns[event.chat_id] = current_time
+    except: pass
+
+async def forced_sub_handler(client, event):
+    try:
+        if any(x in event.raw_text.lower() for x in ["join", "اشترك"]):
+            links = re.findall(r'(https?://t\.me/[^\s]+)', event.raw_text)
+            for l in links: await process_temp_join(client, l)
+            if event.message.buttons:
+                for row in event.message.buttons:
+                    for b in row:
+                        if b.url: await process_temp_join(client, b.url)
+                        else: 
+                            await asyncio.sleep(2)
+                            try: await b.click()
+                            except: pass
+    except: pass
+
+async def process_temp_join(client, link):
+    try:
+        link = link.strip()
+        cid = 0
+        if "+" in link or "joinchat" in link:
+            h = link.split("+")[-1].replace("https://t.me/joinchat/", "")
+            u = await client(ImportChatInviteRequest(h))
+            if u.chats: cid = u.chats[0].id
+        else:
+            link = link.replace('@', '').replace('https://t.me/', '')
+            await client(JoinChannelRequest(link))
+            en = await client.get_entity(link)
+            cid = en.id
+        if cid: await subs_col.update_one({"owner_id": client.owner_id, "chat_id": cid}, {"$set": {"join_time": time.time()}}, upsert=True)
+    except: pass
+
+# ==========================================
+#      8. المهام الخلفية
+# ==========================================
+async def global_auto_leave():
+    while True:
+        try:
+            now = time.time()
+            async for d in subs_col.find({}):
+                if now - d['join_time'] > 86400:
+                    try: await active_clients[d['owner_id']](LeaveChannelRequest(d['chat_id']))
+                    except: pass
+                    await subs_col.delete_one({"_id": d['_id']})
+        except: pass
+        await asyncio.sleep(3600)
+
+async def run_bc(client, msg, obj, trg):
+    s = 0
+    try:
+        async for d in client.iter_dialogs():
+            ok = (trg=="groups" and d.is_group) or (trg=="private" and d.is_user and not d.entity.bot)
+            if ok:
+                try: await client.send_message(d.id, obj); s+=1; await asyncio.sleep(0.5)
+                except: pass
+    except: pass
+    await msg.reply(f"✅ تم النشر: {s}")
+
+async def run_task(client, msg, h, k, r, delay):
+    c = 0
+    lim = time.time() - (h*3600)
+    try:
+        me = await client.get_me()
+        async for d in client.iter_dialogs(limit=None):
+            if d.is_group:
+                async for m in client.iter_messages(d.id, limit=20, search=k):
+                    if m.date.timestamp() > lim and m.sender_id != me.id:
+                        try: await client.send_message(d.id, r, reply_to=m.id); c+=1; await asyncio.sleep(delay)
+                        except: pass
+    except: pass
+    await msg.reply(f"✅ تم الرد: {c}")
+
+async def clean_acc(client, msg):
+    c=0
+    async for d in client.iter_dialogs():
+        if isinstance(d.entity, User) and d.entity.deleted:
+            try: await client.delete_dialog(d.id); c+=1
+            except: pass
+    await msg.edit(f"✅ حذف: {c}")
+
+async def get_stats(client):
+    try:
+        d = await client.get_dialogs()
+        return f"📊 محادثات: {len(d)}"
+    except: return "خطأ"
+
+# ==========================================
+#      9. القائمة والتفاعل
+# ==========================================
+@bot.on(events.NewMessage(pattern='/start'))
+async def start_handler(event):
+    await show_menu(event)
+
+async def show_menu(event):
+    cid = event.chat_id
+    if cid in active_clients and await active_clients[cid].is_user_authorized():
+        s = await ai_settings_col.find_one({"owner_id": cid})
+        act = s.get('active', False) if s else False
+        btn_text = "🟢 الذكاء يعمل" if act else "🔴 الذكاء متوقف"
+        btn_data = b"ai_off" if act else b"ai_on"
+        
+        btns = [
+            [Button.inline(btn_text, btn_data)],
+            [Button.inline("🕵️‍♂️ استنساخ (405B)", b"deep_scan")],
+            [Button.inline("🗣️ نقاش لتدريب البوت", b"consult"), Button.inline("💰 فحص LTC", b"chk_pay")],
+            [Button.inline("📢 نشر للجروبات", b"bc_groups"), Button.inline("📢 نشر للخاص", b"bc_private")],
+            [Button.inline("🚀 مهام بحث", b"task"), Button.inline("⏳ انضمام مؤقت", b"join")],
+            [Button.inline("📊 إحصائيات", b"stats"), Button.inline("🧹 تنظيف", b"clean")],
+            [Button.inline("➕ إضافة رد", b"add_rep"), Button.inline("📋 الردود", b"list_rep")],
+            [Button.inline("🗑️ حذف رد", b"del_rep"), Button.inline("ℹ️ معلومات", b"info")]
+        ]
+        await event.respond("✅ **لوحة التحكم (SambaNova Llama 405B)**\n🚀 أذكى نموذج مجاني في العالم حالياً.", buttons=btns)
+    else:
+        await event.respond("👋", buttons=[[Button.inline("🔐 دخول", b"login")]])
+
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
-    try:
-        data = event.data.decode(); sid = event.sender_id
-        
-        if data == "refresh_panel": await show_control_panel(event, edit=True)
-        elif data == "invoice_menu": await show_invoice_menu(event)
-        elif data == "tools_menu": await show_tools_menu(event)
-        elif data == "manage_kw_menu": await show_keywords_main_menu(event)
-        
-        elif data == "toggle_run": settings["running"]=not settings["running"]; save_data(); await show_control_panel(event, edit=True)
-        elif data == "toggle_spy": settings["spy_mode"]=not settings["spy_mode"]; save_data(); await show_control_panel(event, edit=True)
-        elif data == "toggle_ghost": settings["ghost_mode"]=not settings["ghost_mode"]; save_data(); await show_control_panel(event, edit=True)
-        elif data == "toggle_bio": settings["auto_bio"]=not settings["auto_bio"]; save_data(); await show_control_panel(event, edit=True)
-        
-        elif data == "add_word": user_state[sid]="add_word"; await event.respond("أرسل الكلمة:"); await event.delete()
-        elif data == "add_reply": user_state[sid]="add_reply"; await event.respond("أرسل الرد:"); await event.delete()
-        
-        elif data == "store_settings": user_state[sid]="set_store"; await event.respond("اسم المتجر:"); await event.delete()
-        elif data == "start_fast_invoice": invoice_drafts[sid]={}; user_state[sid]="inv_c"; await event.respond("العميل:"); await event.delete()
-        
-        elif data == "login": user_state[sid]="login"; await event.respond("الكود:"); await event.delete()
-        elif data == "logout": settings["session"]=None; save_data(); await event.edit("✅"); await show_login_button(event)
-        
-        elif data == "log_settings":
-            try: c=await user_client(CreateChannelRequest("Logs", "Logs", megagroup=False)); settings["log_channel"]=int(f"-100{c.chats[0].id}"); save_data(); await event.answer("تم")
-            except: await event.answer("Error")
+    cid = event.chat_id
+    data = event.data
+    cli = active_clients.get(cid)
 
-    except: traceback.print_exc()
+    if data == b"login":
+        USER_STATE[cid] = "SESS"
+        await event.respond("🔐 **كود الجلسة:**")
+    
+    elif data == b"ai_on":
+        await ai_settings_col.update_one({"owner_id": cid}, {"$set": {"active": True}}, upsert=True)
+        await show_menu(event)
+    elif data == b"ai_off":
+        await ai_settings_col.update_one({"owner_id": cid}, {"$set": {"active": False}}, upsert=True)
+        await show_menu(event)
+
+    elif data == b"deep_scan":
+        if not cli: return
+        msg = await event.respond("🚀 **بدأ التحليل بالذكاء الخارق...**")
+        asyncio.create_task(perform_ultimate_analysis(cli, cid, msg))
+
+    elif data == b"consult":
+        USER_STATE[cid] = "CONSULT"
+        AI_CONTEXT[cid] = [
+            {"role": "system", "content": "أنت خبير تطوير أعمال. قم بإجراء مقابلة مع المستخدم (التاجر) لفهم منتجاته وأسعاره. اسأل سؤالاً واحداً في كل مرة."}
+        ]
+        first_q = await ask_smart_ai(AI_CONTEXT[cid])
+        AI_CONTEXT[cid].append({"role": "assistant", "content": first_q})
+        await event.respond(f"🗣️ **بدء جلسة التدريب والمناقشة**\n\n{first_q}\n\n(لإنهاء وحفظ المناقشة اكتب: **تم**)")
+    
+    elif data == b"chk_pay":
+        USER_STATE[cid] = "TX"
+        await event.respond("💰 **الهاش:**")
+    
+    elif data == b"bc_groups":
+        USER_STATE[cid] = "BC_GROUP"
+        await event.respond("📢 **رسالة الجروبات:**")
+    elif data == b"bc_private":
+        USER_STATE[cid] = "BC_PRIVATE"
+        await event.respond("📢 **رسالة الخاص:**")
+    elif data == b"task":
+        USER_STATE[cid] = "TASK_H"
+        TASK_DATA[cid] = {}
+        await event.respond("1️⃣ الساعات؟")
+    elif data == b"join":
+        USER_STATE[cid] = "JOIN"
+        await event.respond("⏳ الرابط:")
+    elif data == b"stats":
+        msg = await get_stats(cli)
+        await event.respond(msg)
+    elif data == b"clean":
+        m = await event.respond("🧹...")
+        asyncio.create_task(clean_acc(cli, m))
+    elif data == b"add_rep":
+        USER_STATE[cid] = "ADD_KEY"
+        await event.respond("📝 **الكلمة:**")
+    elif data == b"list_rep":
+        s="**📋 الردود:**\n"
+        async for d in replies_col.find({"owner_id": cid}): s+=f"- `{d['keyword']}`\n"
+        await event.respond(s)
+    elif data == b"del_rep":
+        USER_STATE[cid] = "DEL_KEY"
+        await event.respond("🗑️ **الكلمة:**")
+    elif data == b"info":
+        await event.respond("🤖 **Model:** Llama 3.1 405B (SambaNova)\n✅ **Status:** Super Intelligent")
 
 @bot.on(events.NewMessage)
 async def input_handler(event):
-    if event.sender_id == (await bot.get_me()).id: return
-    sid = event.sender_id; st = user_state.get(sid); txt = event.text.strip()
+    cid = event.chat_id
+    txt = event.text.strip()
+    st = USER_STATE.get(cid)
+    if not st or txt.startswith('/'): return
 
-    if st == "login":
-        try:
-            c = TelegramClient(StringSession(txt), API_ID, API_HASH); await c.connect()
-            if await c.is_user_authorized(): settings["session"]=txt; save_data(); await c.disconnect(); await event.reply("✅"); await start_user_bot(); await show_control_panel(event)
-            else: await event.reply("❌")
-        except: await event.reply("❌")
-        user_state[sid] = None
+    if st == "SESS":
+        if await start_userbot(cid, txt):
+            await sessions_col.update_one({"_id": cid}, {"$set": {"session_string": txt}}, upsert=True)
+            await event.respond("✅")
+            await show_menu(event)
+        else: await event.respond("❌")
+        USER_STATE[cid] = None
 
-    elif st == "add_word": settings["keywords"].append(txt); save_data(); await event.reply("✅"); user_state[sid]=None
-    elif st == "add_reply": settings["replies"].append(txt); save_data(); await event.reply("✅"); user_state[sid]=None
-    
-    elif st == "set_store": settings["store_name"]=txt; save_data(); await event.reply("✅"); user_state[sid]=None
-    elif st == "inv_c": invoice_drafts[sid]['client_name']=txt; user_state[sid]="inv_p"; await event.reply("المنتج:")
-    elif st == "inv_p": invoice_drafts[sid]['product']=txt; user_state[sid]="inv_q"; await event.reply("العدد:")
-    elif st == "inv_q": invoice_drafts[sid]['count']=txt; user_state[sid]="inv_pr"; await event.reply("السعر:")
-    elif st == "inv_pr": invoice_drafts[sid]['price']=txt; user_state[sid]="inv_w"; await event.reply("الضمان:")
-    elif st == "inv_w":
-        invoice_drafts[sid]['warranty']=txt; code=''.join([str(random.randint(0,9)) for _ in range(16)])
-        settings["invoices_archive"][code]=invoice_drafts[sid]; save_data()
-        fn=f"Inv_{code}.pdf"
-        if create_arabic_invoice(invoice_drafts[sid], code, fn): await event.client.send_file(event.chat_id, fn, caption=f"`{code}`"); os.remove(fn)
-        user_state[sid]=None; await show_invoice_menu(event)
+    elif st == "CONSULT":
+        if txt == "تم" or txt == "انتهى":
+            await event.respond("⏳ **جاري تلخيص المناقشة وحفظ شخصية البوت...**")
+            AI_CONTEXT[cid].append({"role": "user", "content": "تم. الآن بناءً على كل نقاشنا السابق، اكتب System Prompt نهائي وشامل يمثلني كتاجر، يتضمن كل الأسعار والخدمات."})
+            final_save = await ask_smart_ai(AI_CONTEXT[cid])
+            if final_save:
+                await ai_settings_col.update_one({"owner_id": cid}, {"$set": {"prompt": final_save}}, upsert=True)
+                await event.respond(f"✅ **تم الحفظ!**\n\nالبوت الآن جاهز ويعرف كل التفاصيل.\n`{final_save[:200]}...`")
+            else: await event.respond("❌ حدث خطأ أثناء الحفظ.")
+            USER_STATE[cid] = None
+            AI_CONTEXT[cid] = [] 
+        else:
+            async with bot.action(cid, 'typing'):
+                AI_CONTEXT[cid].append({"role": "user", "content": txt})
+                ai_response = await ask_smart_ai(AI_CONTEXT[cid])
+                if ai_response:
+                    AI_CONTEXT[cid].append({"role": "assistant", "content": ai_response})
+                    await event.reply(ai_response)
 
-# --- Server & Start ---
-async def web_page(request): return web.Response(text="Bot Alive")
-async def server():
-    app=web.Application(); app.add_routes([web.get('/', web_page)])
-    runner=web.AppRunner(app); await runner.setup()
-    site=web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT",8080))); await site.start()
+    elif st == "TX":
+        v, i = await verify_ltc(txt)
+        await event.respond(f"{'✅' if v else '❌'} {i}")
+        USER_STATE[cid] = None
+    elif st == "BC_GROUP":
+        m = await event.respond("🚀...")
+        asyncio.create_task(run_bc(active_clients[cid], m, event.message, "groups"))
+        USER_STATE[cid] = None
+    elif st == "BC_PRIVATE":
+        m = await event.respond("🚀...")
+        asyncio.create_task(run_bc(active_clients[cid], m, event.message, "private"))
+        USER_STATE[cid] = None
+    elif st == "JOIN":
+        m = await event.respond("⏳...")
+        asyncio.create_task(process_temp_join(active_clients[cid], txt))
+        USER_STATE[cid] = None
+    elif st == "ADD_KEY":
+        TASK_DATA[cid] = {"k": txt}
+        USER_STATE[cid] = "VAL"
+        await event.respond("📝 **الرد:**")
+    elif st == "VAL":
+        await replies_col.update_one({"owner_id": cid, "keyword": TASK_DATA[cid]["k"]}, {"$set": {"reply": txt}}, upsert=True)
+        await event.respond("✅")
+        USER_STATE[cid] = None
+    elif st == "DEL_KEY":
+        await replies_col.delete_one({"owner_id": cid, "keyword": txt})
+        await event.respond("🗑️")
+        USER_STATE[cid] = None
+    elif st == "TASK_H":
+        TASK_DATA[cid] = {"h": int(txt)}
+        USER_STATE[cid] = "TK"
+        await event.respond("🔎 **كلمة:**")
+    elif st == "TK":
+        TASK_DATA[cid]["k"] = txt
+        USER_STATE[cid] = "TR"
+        await event.respond("📝 **الرد:**")
+    elif st == "TR":
+        TASK_DATA[cid]["r"] = event.message
+        USER_STATE[cid] = "TD"
+        await event.respond("⏱️ **ثواني:**")
+    elif st == "TD":
+        m = await event.respond("🚀...")
+        asyncio.create_task(run_task(active_clients[cid], m, TASK_DATA[cid]["h"], TASK_DATA[cid]["k"], TASK_DATA[cid]["r"], int(txt)))
+        USER_STATE[cid] = None
 
-async def show_login_button(event): await event.respond("👋", buttons=[[Button.inline("➕ Login", b"login")]])
-
-@bot.on(events.NewMessage(pattern='/start'))
-async def on_start(event):
-    load_data()
-    if settings["session"]: await start_user_bot(); await show_control_panel(event)
-    else: await show_login_button(event)
+async def main():
+    await start_web_server()
+    await load_all_sessions()
+    asyncio.create_task(global_auto_leave())
+    print("✅ Bot Started (SambaNova Engine)")
+    await bot.start(bot_token=BOT_TOKEN)
+    await bot.run_until_disconnected()
 
 if __name__ == '__main__':
-    loop = asyncio.get_event_loop()
-    loop.create_task(server())
-    bot.run_until_disconnected()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt: pass
