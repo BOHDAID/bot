@@ -13,26 +13,36 @@ from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.types import User
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import web
+from dotenv import load_dotenv
+
+# تحميل متغيرات البيئة من ملف .env إذا وجد
+load_dotenv()
 
 # ==========================================
 #      1. الإعدادات والتهيئة
 # ==========================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-# --- استدعاء المتغيرات من النظام (السرية) ---
-API_ID = 6
-API_HASH = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
-BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# --- قاعدة البيانات والذكاء الاصطناعي ---
+# --- استدعاء المتغيرات من النظام مع التحقق الصارم ---
+API_ID_RAW = os.getenv("API_ID")
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
+
+# التحقق من وجود القيم الأساسية قبل البدء
+if not all([API_ID_RAW, API_HASH, BOT_TOKEN, MONGO_URI]):
+    missing = [k for k, v in {"API_ID": API_ID_RAW, "API_HASH": API_HASH, "BOT_TOKEN": BOT_TOKEN, "MONGO_URI": MONGO_URI}.items() if not v]
+    print(f"❌ خطأ: المتغيرات التالية ناقصة في إعدادات Render: {', '.join(missing)}")
+    sys.exit(1)
+
+API_ID = int(API_ID_RAW)
+# المتغيرات الأخرى
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-# --- إعدادات إضافية ---
 MY_LTC_ADDRESS = os.getenv("MY_LTC_ADDRESS", "عنوان_محفظتك_هنا")
 
-# 🔥 مفتاح SambaNova (تم تركيبه) 🔥
+# 🔥 مفتاح SambaNova 🔥
 SAMBANOVA_API_KEY = "b1818ac7-46d5-4d95-bf75-8ad864b0b8de"
 
 # إعداد العميل الذكي
@@ -41,13 +51,11 @@ try:
         base_url="https://api.sambanova.ai/v1",
         api_key=SAMBANOVA_API_KEY
     )
-    # الموديل الخارق Llama 3.1 405B
     AI_MODEL = "Meta-Llama-3.1-405B-Instruct"
     print(f"✅ تم تفعيل الوحش: {AI_MODEL}")
 except Exception as e:
     print(f"❌ خطأ في الإعداد: {e}")
 
-# القاعدة الصارمة للبوت أثناء الرد على العملاء
 STRICT_RULE = """
 تعليمات النظام (System Prompt):
 أنت تاجر سعودي محترف، ولست ذكاءً اصطناعياً.
@@ -60,7 +68,7 @@ STRICT_RULE = """
 active_clients = {}      
 USER_STATE = {}          
 TASK_DATA = {}           
-AI_CONTEXT = {} # ذاكرة النقاش
+AI_CONTEXT = {} 
 
 # ==========================================
 #      2. قاعدة البيانات
@@ -73,7 +81,9 @@ try:
     subs_col = db['subscriptions']      
     ai_settings_col = db['ai_prompts']  
     print("✅ DB Connected")
-except: sys.exit(1)
+except Exception as e:
+    print(f"❌ DB Error: {e}")
+    sys.exit(1)
 
 # ==========================================
 #      3. البوت والخادم
@@ -92,12 +102,9 @@ async def start_web_server():
     await site.start()
 
 # ==========================================
-#      4. محرك الذكاء (للحوار والنقاش)
+#      4. محرك الذكاء
 # ==========================================
 async def ask_smart_ai(messages_history):
-    """
-    دالة المحادثة التفاعلية
-    """
     try:
         response = await ai_client.chat.completions.create(
             model=AI_MODEL,
@@ -144,10 +151,8 @@ async def perform_ultimate_analysis(client, owner_id, status_msg):
             except:
                 with open("report.txt", "w", encoding="utf-8") as f: f.write(final_res)
                 await client.send_file("me", "report.txt", caption="📝 **التقرير**")
-
             return "✅ **تم الاستنساخ بذكاء 405B!**"
         else: return "❌ فشل التحليل."
-
     except Exception as e:
         return f"خطأ: {e}"
 
@@ -212,7 +217,6 @@ async def userbot_incoming_handler(client, event):
 
         if has_img:
             try:
-                me = await client.get_me()
                 sender = await event.get_sender()
                 await client.send_message("me", f"📸 **إثبات من:** {sender.first_name}", file=event.message.photo)
             except: pass
@@ -241,15 +245,11 @@ async def userbot_incoming_handler(client, event):
             elif has_img: pay_info = "\n[النظام: العميل أرسل صورة]"
 
             saved_persona = settings.get('prompt', "أنت تاجر.") if settings else "أنت تاجر."
-            
-            # محادثة لمرة واحدة للرد على العميل
             msgs = [
                 {"role": "system", "content": f"{STRICT_RULE}\n\nبياناتك وشخصيتك:\n{saved_persona}\n{pay_info}"},
                 {"role": "user", "content": text if text else "صورة"}
             ]
-            
             ai_reply = await ask_smart_ai(msgs)
-            
             if ai_reply: await event.reply(ai_reply)
             client.cooldowns[event.chat_id] = current_time
     except: pass
@@ -276,7 +276,7 @@ async def process_temp_join(client, link):
         if "+" in link or "joinchat" in link:
             h = link.split("+")[-1].replace("https://t.me/joinchat/", "")
             u = await client(ImportChatInviteRequest(h))
-            if u.chats: cid = u.chats[0].id
+            cid = u.chats[0].id
         else:
             link = link.replace('@', '').replace('https://t.me/', '')
             await client(JoinChannelRequest(link))
@@ -353,7 +353,6 @@ async def show_menu(event):
         act = s.get('active', False) if s else False
         btn_text = "🟢 الذكاء يعمل" if act else "🔴 الذكاء متوقف"
         btn_data = b"ai_off" if act else b"ai_on"
-        
         btns = [
             [Button.inline(btn_text, btn_data)],
             [Button.inline("🕵️‍♂️ استنساخ (405B)", b"deep_scan")],
@@ -373,39 +372,28 @@ async def callback_handler(event):
     cid = event.chat_id
     data = event.data
     cli = active_clients.get(cid)
-
     if data == b"login":
         USER_STATE[cid] = "SESS"
         await event.respond("🔐 **كود الجلسة:**")
-    
     elif data == b"ai_on":
         await ai_settings_col.update_one({"owner_id": cid}, {"$set": {"active": True}}, upsert=True)
         await show_menu(event)
     elif data == b"ai_off":
         await ai_settings_col.update_one({"owner_id": cid}, {"$set": {"active": False}}, upsert=True)
         await show_menu(event)
-
     elif data == b"deep_scan":
         if not cli: return
         msg = await event.respond("🚀 **بدأ التحليل بالذكاء الخارق...**")
         asyncio.create_task(perform_ultimate_analysis(cli, cid, msg))
-
     elif data == b"consult":
         USER_STATE[cid] = "CONSULT"
-        # بدء سجل المحادثة
-        AI_CONTEXT[cid] = [
-            {"role": "system", "content": "أنت خبير تطوير أعمال. قم بإجراء مقابلة مع المستخدم (التاجر) لفهم منتجاته وأسعاره. اسأل سؤالاً واحداً في كل مرة."}
-        ]
-        # طلب أول سؤال من الذكاء
+        AI_CONTEXT[cid] = [{"role": "system", "content": "أنت خبير تطوير أعمال. قم بإجراء مقابلة مع المستخدم (التاجر) لفهم منتجاته وأسعاره. اسأل سؤالاً واحداً في كل مرة."}]
         first_q = await ask_smart_ai(AI_CONTEXT[cid])
         AI_CONTEXT[cid].append({"role": "assistant", "content": first_q})
-        
         await event.respond(f"🗣️ **بدء جلسة التدريب والمناقشة**\n\n{first_q}\n\n(لإنهاء وحفظ المناقشة اكتب: **تم**)")
-    
     elif data == b"chk_pay":
         USER_STATE[cid] = "TX"
         await event.respond("💰 **الهاش:**")
-    
     elif data == b"bc_groups":
         USER_STATE[cid] = "BC_GROUP"
         await event.respond("📢 **رسالة الجروبات:**")
@@ -444,7 +432,6 @@ async def input_handler(event):
     txt = event.text.strip()
     st = USER_STATE.get(cid)
     if not st or txt.startswith('/'): return
-
     if st == "SESS":
         if await start_userbot(cid, txt):
             await sessions_col.update_one({"_id": cid}, {"$set": {"session_string": txt}}, upsert=True)
@@ -452,39 +439,24 @@ async def input_handler(event):
             await show_menu(event)
         else: await event.respond("❌")
         USER_STATE[cid] = None
-
-    # --- وضع المناقشة التفاعلية (The Chat & Debate) ---
     elif st == "CONSULT":
         if txt == "تم" or txt == "انتهى":
             await event.respond("⏳ **جاري تلخيص المناقشة وحفظ شخصية البوت...**")
-            
-            # الطلب النهائي للتلخيص
             AI_CONTEXT[cid].append({"role": "user", "content": "تم. الآن بناءً على كل نقاشنا السابق، اكتب System Prompt نهائي وشامل يمثلني كتاجر، يتضمن كل الأسعار والخدمات."})
-            
             final_save = await ask_smart_ai(AI_CONTEXT[cid])
-            
             if final_save:
                 await ai_settings_col.update_one({"owner_id": cid}, {"$set": {"prompt": final_save}}, upsert=True)
                 await event.respond(f"✅ **تم الحفظ!**\n\nالبوت الآن جاهز ويعرف كل التفاصيل.\n`{final_save[:200]}...`")
-            else:
-                await event.respond("❌ حدث خطأ أثناء الحفظ.")
-
+            else: await event.respond("❌ حدث خطأ أثناء الحفظ.")
             USER_STATE[cid] = None
-            AI_CONTEXT[cid] = [] # مسح الذاكرة المؤقتة
+            AI_CONTEXT[cid] = []
         else:
-            # استمرار النقاش
             async with bot.action(cid, 'typing'):
-                # 1. إضافة رد المستخدم للسجل
                 AI_CONTEXT[cid].append({"role": "user", "content": txt})
-                
-                # 2. الحصول على رد الذكاء
                 ai_response = await ask_smart_ai(AI_CONTEXT[cid])
-                
                 if ai_response:
-                    # 3. إضافة رد الذكاء للسجل وإرساله
                     AI_CONTEXT[cid].append({"role": "assistant", "content": ai_response})
                     await event.reply(ai_response)
-
     elif st == "TX":
         v, i = await verify_ltc(txt)
         await event.respond(f"{'✅' if v else '❌'} {i}")
@@ -514,9 +486,11 @@ async def input_handler(event):
         await event.respond("🗑️")
         USER_STATE[cid] = None
     elif st == "TASK_H":
-        TASK_DATA[cid] = {"h": int(txt)}
-        USER_STATE[cid] = "TK"
-        await event.respond("🔎 **كلمة:**")
+        try:
+            TASK_DATA[cid] = {"h": int(txt)}
+            USER_STATE[cid] = "TK"
+            await event.respond("🔎 **كلمة:**")
+        except: await event.respond("❌ رقم خطأ")
     elif st == "TK":
         TASK_DATA[cid]["k"] = txt
         USER_STATE[cid] = "TR"
@@ -526,9 +500,11 @@ async def input_handler(event):
         USER_STATE[cid] = "TD"
         await event.respond("⏱️ **ثواني:**")
     elif st == "TD":
-        m = await event.respond("🚀...")
-        asyncio.create_task(run_task(active_clients[cid], m, TASK_DATA[cid]["h"], TASK_DATA[cid]["k"], TASK_DATA[cid]["r"], int(txt)))
-        USER_STATE[cid] = None
+        try:
+            m = await event.respond("🚀...")
+            asyncio.create_task(run_task(active_clients[cid], m, TASK_DATA[cid]["h"], TASK_DATA[cid]["k"], TASK_DATA[cid]["r"], int(txt)))
+            USER_STATE[cid] = None
+        except: await event.respond("❌ رقم خطأ")
 
 async def main():
     await start_web_server()
@@ -543,6 +519,4 @@ if __name__ == '__main__':
         loop = asyncio.get_event_loop()
         loop.run_until_complete(main())
     except KeyboardInterrupt: pass
-
-
-
+    except Exception as e: print(f"Error: {e}")
