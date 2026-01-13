@@ -1,12 +1,10 @@
 telethon
-pymongo
+motor
+aiohttp
+openai
+python-dotenv
 certifi
 fpdf
 arabic-reshaper
 python-bidi
 requests
-aiohttp
-python-dotenv
-motor
-aiohttp
-openai
