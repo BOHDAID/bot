@@ -5,7 +5,7 @@ import logging
 import time
 import re
 import aiohttp
-from openai import AsyncOpenAI 
+from openai import AsyncOpenAI
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
@@ -24,7 +24,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- استدعاء المتغيرات من النظام مع التحقق الصارم ---
+# --- استدعاء المتغيرات من النظام مع التحقق ---
 API_ID_RAW = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -33,17 +33,18 @@ MONGO_URI = os.getenv("MONGO_URI")
 # التحقق من وجود القيم الأساسية قبل البدء
 if not all([API_ID_RAW, API_HASH, BOT_TOKEN, MONGO_URI]):
     missing = [k for k, v in {"API_ID": API_ID_RAW, "API_HASH": API_HASH, "BOT_TOKEN": BOT_TOKEN, "MONGO_URI": MONGO_URI}.items() if not v]
-    print(f"❌ خطأ: المتغيرات التالية ناقصة في إعدادات Render: {', '.join(missing)}")
+    print(f"❌ خطأ: المتغيرات التالية ناقصة في الإعدادات: {', '.join(missing)}")
     sys.exit(1)
 
 API_ID = int(API_ID_RAW)
+
 # المتغيرات الأخرى
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MY_LTC_ADDRESS = os.getenv("MY_LTC_ADDRESS", "عنوان_محفظتك_هنا")
 
 # 🔥 مفتاح SambaNova 🔥
-SAMBANOVA_API_KEY = "b1818ac7-46d5-4d95-bf75-8ad864b0b8de"
+SAMBANOVA_API_KEY = os.getenv("SAMBANOVA_API_KEY", "b1818ac7-46d5-4d95-bf75-8ad864b0b8de")
 
 # إعداد العميل الذكي
 try:
@@ -55,6 +56,7 @@ try:
     print(f"✅ تم تفعيل الوحش: {AI_MODEL}")
 except Exception as e:
     print(f"❌ خطأ في الإعداد: {e}")
+    sys.exit(1)
 
 STRICT_RULE = """
 تعليمات النظام (System Prompt):
@@ -65,10 +67,11 @@ STRICT_RULE = """
 4. إذا لم تتوفر معلومة، اطلبها من العميل بذكاء.
 """
 
-active_clients = {}      
-USER_STATE = {}          
-TASK_DATA = {}           
-AI_CONTEXT = {} 
+active_clients = {}
+USER_STATE = {}
+TASK_DATA = {}
+AI_CONTEXT = {}
+REPLY_COOLDOWN = {} # 🆕 تخزين توقيت الردود (User + Keyword)
 
 # ==========================================
 #      2. قاعدة البيانات
@@ -76,10 +79,10 @@ AI_CONTEXT = {}
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URI)
     db = mongo_client['MyTelegramBotDB']
-    sessions_col = db['sessions']       
-    replies_col = db['replies']         
-    subs_col = db['subscriptions']      
-    ai_settings_col = db['ai_prompts']  
+    sessions_col = db['sessions']
+    replies_col = db['replies']
+    subs_col = db['subscriptions']
+    ai_settings_col = db['ai_prompts']
     print("✅ DB Connected")
 except Exception as e:
     print(f"❌ DB Error: {e}")
@@ -100,6 +103,7 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', 8080)
     await site.start()
+    print("✅ Web Server Started on port 8080")
 
 # ==========================================
 #      4. محرك الذكاء
@@ -109,7 +113,7 @@ async def ask_smart_ai(messages_history):
         response = await ai_client.chat.completions.create(
             model=AI_MODEL,
             messages=messages_history,
-            temperature=0.7, 
+            temperature=0.7,
             top_p=0.9
         )
         return response.choices[0].message.content
@@ -128,7 +132,7 @@ async def perform_ultimate_analysis(client, owner_id, status_msg):
         collected_data = ""
         count = 0
         async for dialog in client.iter_dialogs(limit=20):
-            if count > 10000: break 
+            if count > 10000: break
             if dialog.is_user and not dialog.entity.bot:
                 async for msg in client.iter_messages(dialog.id, limit=5):
                     if msg.out and msg.text:
@@ -206,13 +210,36 @@ async def load_all_sessions():
 #      7. المعالجات
 # ==========================================
 async def userbot_incoming_handler(client, event):
-    if not event.is_private: return 
+    if not event.is_private and not event.is_group: return 
     try:
         owner_id = client.owner_id
+        text = event.raw_text or ""
+        sender_id = event.sender_id # معرف المرسل
+        
+        # 1. التحقق من الردود المحفوظة (مع ميزة 10 دقائق)
+        cursor = replies_col.find({"owner_id": owner_id})
+        async for d in cursor:
+            if d['keyword'] in text:
+                # 🆕 --- المنطق الجديد (10 دقائق) ---
+                # المفتاح: (رقم الشات، رقم المرسل، الكلمة)
+                cool_key = (event.chat_id, sender_id, d['keyword'])
+                last_reply_time = REPLY_COOLDOWN.get(cool_key, 0)
+                current_time = time.time()
+                
+                # إذا لم تمر 10 دقائق (600 ثانية) تجاهل
+                if current_time - last_reply_time < 600:
+                    return 
+                
+                # تحديث الوقت والرد
+                REPLY_COOLDOWN[cool_key] = current_time
+                await event.reply(d['reply'])
+                return 
+
+        # 2. التحقق من الذكاء الاصطناعي (للخاص فقط)
+        if not event.is_private: return
+
         settings = await ai_settings_col.find_one({"owner_id": owner_id})
         is_ai_active = settings.get('active', False) if settings else False
-        
-        text = event.raw_text or ""
         has_img = bool(event.message.photo)
 
         if has_img:
@@ -221,16 +248,9 @@ async def userbot_incoming_handler(client, event):
                 await client.send_message("me", f"📸 **إثبات من:** {sender.first_name}", file=event.message.photo)
             except: pass
 
-        if not text and not has_img: return
-
-        cursor = replies_col.find({"owner_id": owner_id})
-        async for d in cursor:
-            if d['keyword'] in text:
-                await event.reply(d['reply'])
-                return 
-
         if not is_ai_active: return 
 
+        # مؤقت الذكاء الاصطناعي (5 ثواني لمنع الإزعاج العام)
         current_time = time.time()
         if current_time - client.cooldowns.get(event.chat_id, 0) > 5: 
             try:
@@ -314,13 +334,24 @@ async def run_bc(client, msg, obj, trg):
 async def run_task(client, msg, h, k, r, delay):
     c = 0
     lim = time.time() - (h*3600)
+    # 🆕 قائمة لتتبع من تم الرد عليهم في هذه المهمة فقط
+    replied_users_this_task = set()
+    
     try:
         me = await client.get_me()
         async for d in client.iter_dialogs(limit=None):
             if d.is_group:
                 async for m in client.iter_messages(d.id, limit=20, search=k):
                     if m.date.timestamp() > lim and m.sender_id != me.id:
-                        try: await client.send_message(d.id, r, reply_to=m.id); c+=1; await asyncio.sleep(delay)
+                        # 🆕 --- المنطق الجديد (رد واحد لكل مستخدم) ---
+                        if m.sender_id in replied_users_this_task:
+                            continue # تجاهل إذا رددنا عليه سابقاً في هذه المهمة
+                        
+                        try: 
+                            await client.send_message(d.id, r, reply_to=m.id)
+                            c+=1
+                            replied_users_this_task.add(m.sender_id) # تسجيل المستخدم
+                            await asyncio.sleep(delay)
                         except: pass
     except: pass
     await msg.reply(f"✅ تم الرد: {c}")
