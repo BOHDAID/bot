@@ -5,17 +5,18 @@ import logging
 import time
 import re
 import aiohttp
-from openai import AsyncOpenAI
+from datetime import datetime
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
+from telethon.tl.types import UserStatusOnline, UserStatusRecently, ChannelParticipantsAdmins
+from telethon.tl.functions.messages import ImportChatInviteRequest, GetHistoryRequest
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.types import User
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import web
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
-# تحميل متغيرات البيئة من ملف .env إذا وجد
+# تحميل متغيرات البيئة
 load_dotenv()
 
 # ==========================================
@@ -24,54 +25,39 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- استدعاء المتغيرات من النظام مع التحقق ---
+# --- استدعاء المتغيرات ---
 API_ID_RAW = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 
-# التحقق من وجود القيم الأساسية قبل البدء
 if not all([API_ID_RAW, API_HASH, BOT_TOKEN, MONGO_URI]):
-    missing = [k for k, v in {"API_ID": API_ID_RAW, "API_HASH": API_HASH, "BOT_TOKEN": BOT_TOKEN, "MONGO_URI": MONGO_URI}.items() if not v]
-    print(f"❌ خطأ: المتغيرات التالية ناقصة في الإعدادات: {', '.join(missing)}")
+    print(f"❌ خطأ: المتغيرات ناقصة في ملف .env أو إعدادات السيرفر.")
     sys.exit(1)
 
 API_ID = int(API_ID_RAW)
-
-# المتغيرات الأخرى
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MY_LTC_ADDRESS = os.getenv("MY_LTC_ADDRESS", "عنوان_محفظتك_هنا")
-
-# 🔥 مفتاح SambaNova 🔥
+MY_LTC_ADDRESS = os.getenv("MY_LTC_ADDRESS", "Your_Address_Here")
 SAMBANOVA_API_KEY = os.getenv("SAMBANOVA_API_KEY", "b1818ac7-46d5-4d95-bf75-8ad864b0b8de")
 
 # إعداد العميل الذكي
 try:
-    ai_client = AsyncOpenAI(
-        base_url="https://api.sambanova.ai/v1",
-        api_key=SAMBANOVA_API_KEY
-    )
+    ai_client = AsyncOpenAI(base_url="https://api.sambanova.ai/v1", api_key=SAMBANOVA_API_KEY)
     AI_MODEL = "Meta-Llama-3.1-405B-Instruct"
-    print(f"✅ تم تفعيل الوحش: {AI_MODEL}")
-except Exception as e:
-    print(f"❌ خطأ في الإعداد: {e}")
-    sys.exit(1)
+except: pass
 
 STRICT_RULE = """
-تعليمات النظام (System Prompt):
-أنت تاجر سعودي محترف، ولست ذكاءً اصطناعياً.
-1. تحدث بلهجة سعودية طبيعية جداً.
-2. لا تستخدم الفصحى المقعرة ولا تعتذر كثيراً.
-3. هدفك البيع وخدمة العميل بناءً على المعلومات المتوفرة.
-4. إذا لم تتوفر معلومة، اطلبها من العميل بذكاء.
+أنت تاجر سعودي محترف. 
+- لهجتك سعودية عامية.
+- هدفك البيع وخدمة العميل.
+- لا تعتذر كثيراً وكن واثقاً.
 """
 
 active_clients = {}
 USER_STATE = {}
 TASK_DATA = {}
-AI_CONTEXT = {}
-REPLY_COOLDOWN = {} # 🆕 تخزين توقيت الردود (User + Keyword)
+AUTO_POST_CONFIG = {} 
+LAST_MSG_IDS = {} 
+REPLY_COOLDOWN = {} # لتخزين توقيت الردود (10 دقائق)
 
 # ==========================================
 #      2. قاعدة البيانات
@@ -80,10 +66,13 @@ try:
     mongo_client = AsyncIOMotorClient(MONGO_URI)
     db = mongo_client['MyTelegramBotDB']
     sessions_col = db['sessions']
-    replies_col = db['replies']
-    subs_col = db['subscriptions']
-    ai_settings_col = db['ai_prompts']
-    print("✅ DB Connected")
+    replies_col = db['replies']      # الردود التلقائية
+    reactions_col = db['reactions']  # التفاعلات
+    ai_settings_col = db['ai_prompts'] # إعدادات الذكاء
+    config_col = db['autopost_config'] # إعدادات النشر الحربي
+    blacklist_col = db['groups_blacklist'] # الجروبات المجمدة
+    admins_watch_col = db['admins_watch']  # رادار المشرفين
+    print("✅ DB Connected - All Systems Ready")
 except Exception as e:
     print(f"❌ DB Error: {e}")
     sys.exit(1)
@@ -103,66 +92,18 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', 8080)
     await site.start()
-    print("✅ Web Server Started on port 8080")
 
 # ==========================================
-#      4. محرك الذكاء
+#      4. أدوات مساعدة (AI & LTC)
 # ==========================================
 async def ask_smart_ai(messages_history):
     try:
         response = await ai_client.chat.completions.create(
-            model=AI_MODEL,
-            messages=messages_history,
-            temperature=0.7,
-            top_p=0.9
+            model=AI_MODEL, messages=messages_history, temperature=0.7, top_p=0.9
         )
         return response.choices[0].message.content
-    except Exception as e:
-        print(f"❌ AI Error: {e}")
-        return None
+    except: return None
 
-# ==========================================
-#      🕵️‍♂️ المحلل الشخصي
-# ==========================================
-async def perform_ultimate_analysis(client, owner_id, status_msg):
-    try:
-        me = await client.get_me()
-        await status_msg.edit("📦 **جاري سحب البيانات...**")
-        
-        collected_data = ""
-        count = 0
-        async for dialog in client.iter_dialogs(limit=20):
-            if count > 10000: break
-            if dialog.is_user and not dialog.entity.bot:
-                async for msg in client.iter_messages(dialog.id, limit=5):
-                    if msg.out and msg.text:
-                        collected_data += f"- {msg.text}\n"
-                        count += len(msg.text)
-        
-        await status_msg.edit("🧠 **المارد (405B) يحلل شخصيتك...**")
-        
-        analysis_msgs = [
-            {"role": "system", "content": "أنت خبير تحليل بيانات."},
-            {"role": "user", "content": f"حلل هذه الرسائل لتاجر واستخرج المنتجات والأسعار والأسلوب، واكتب System Prompt شامل:\n{collected_data[:5000]}"}
-        ]
-        
-        final_res = await ask_smart_ai(analysis_msgs)
-        
-        if final_res:
-            await ai_settings_col.update_one({"owner_id": owner_id}, {"$set": {"prompt": final_res}}, upsert=True)
-            try:
-                await client.send_message("me", f"📝 **تقرير التحليل:**\n\n{final_res}")
-            except:
-                with open("report.txt", "w", encoding="utf-8") as f: f.write(final_res)
-                await client.send_file("me", "report.txt", caption="📝 **التقرير**")
-            return "✅ **تم الاستنساخ بذكاء 405B!**"
-        else: return "❌ فشل التحليل."
-    except Exception as e:
-        return f"خطأ: {e}"
-
-# ==========================================
-#      5. فحص LTC
-# ==========================================
 async def verify_ltc(tx_hash):
     try:
         tx_hash = re.sub(r'[^a-fA-F0-9]', '', tx_hash)
@@ -184,7 +125,7 @@ async def verify_ltc(tx_hash):
     except: return False, "خطأ شبكة"
 
 # ==========================================
-#      6. تشغيل اليوزربوت
+#      5. تشغيل اليوزربوت والمهام
 # ==========================================
 async def start_userbot(owner_id, session_str):
     try:
@@ -194,11 +135,26 @@ async def start_userbot(owner_id, session_str):
         if not await client.is_user_authorized():
             await sessions_col.delete_one({"_id": owner_id})
             return False
+        
         client.owner_id = owner_id
         client.cooldowns = {} 
-        client.add_event_handler(lambda e: userbot_incoming_handler(client, e), events.NewMessage(incoming=True))
-        client.add_event_handler(lambda e: forced_sub_handler(client, e), events.NewMessage(incoming=True))
+
+        # 1. المعالج العام (ردود، تفاعل، ذكاء)
+        client.add_event_handler(lambda e: main_incoming_handler(client, e), events.NewMessage(incoming=True))
+        # 2. معالج الاشتراك الآمن
+        client.add_event_handler(lambda e: safe_join_handler(client, e), events.NewMessage(incoming=True))
+        # 3. ⚔️ مراقب تجميد المشرفين
+        client.add_event_handler(lambda e: admin_reply_monitor(client, e), events.NewMessage(incoming=True))
+        # 4. ⚔️ مراقب فك التجميد (رد المالك)
+        client.add_event_handler(lambda e: owner_reply_resume_handler(client, e), events.NewMessage(outgoing=True))
+        
         active_clients[owner_id] = client
+        
+        # استعادة النشر التلقائي
+        saved_config = await config_col.find_one({"owner_id": owner_id})
+        if saved_config and saved_config.get('active', False):
+            asyncio.create_task(autopost_engine(client, owner_id))
+            
         return True
     except: return False
 
@@ -207,168 +163,188 @@ async def load_all_sessions():
         asyncio.create_task(start_userbot(doc['_id'], doc['session_string']))
 
 # ==========================================
-#      7. المعالجات
+#      6. المعالجات الأساسية (Handlers)
 # ==========================================
-async def userbot_incoming_handler(client, event):
+async def main_incoming_handler(client, event):
     if not event.is_private and not event.is_group: return 
     try:
         owner_id = client.owner_id
         text = event.raw_text or ""
-        sender_id = event.sender_id # معرف المرسل
+        sender_id = event.sender_id 
         
-        # 1. التحقق من الردود المحفوظة (مع ميزة 10 دقائق)
+        # أ. التفاعل الصامت (Auto-React)
+        cursor_react = reactions_col.find({"owner_id": owner_id})
+        async for d in cursor_react:
+            if d['keyword'] in text:
+                try: await event.message.react(d['emoji']); break
+                except: pass
+
+        # ب. الردود التلقائية (مع ميزة 10 دقائق Cooldown)
         cursor = replies_col.find({"owner_id": owner_id})
         async for d in cursor:
             if d['keyword'] in text:
-                # 🆕 --- المنطق الجديد (10 دقائق) ---
-                # المفتاح: (رقم الشات، رقم المرسل، الكلمة)
                 cool_key = (event.chat_id, sender_id, d['keyword'])
-                last_reply_time = REPLY_COOLDOWN.get(cool_key, 0)
-                current_time = time.time()
-                
-                # إذا لم تمر 10 دقائق (600 ثانية) تجاهل
-                if current_time - last_reply_time < 600:
-                    return 
-                
-                # تحديث الوقت والرد
-                REPLY_COOLDOWN[cool_key] = current_time
+                last_reply = REPLY_COOLDOWN.get(cool_key, 0)
+                # الشرط: إذا لم تمر 600 ثانية (10 دقائق) -> تجاهل
+                if time.time() - last_reply < 600: return 
+                REPLY_COOLDOWN[cool_key] = time.time()
                 await event.reply(d['reply'])
                 return 
 
-        # 2. التحقق من الذكاء الاصطناعي (للخاص فقط)
+        # ج. الذكاء الاصطناعي (للخاص فقط)
         if not event.is_private: return
-
         settings = await ai_settings_col.find_one({"owner_id": owner_id})
-        is_ai_active = settings.get('active', False) if settings else False
-        has_img = bool(event.message.photo)
-
-        if has_img:
-            try:
-                sender = await event.get_sender()
-                await client.send_message("me", f"📸 **إثبات من:** {sender.first_name}", file=event.message.photo)
-            except: pass
-
-        if not is_ai_active: return 
-
-        # مؤقت الذكاء الاصطناعي (5 ثواني لمنع الإزعاج العام)
-        current_time = time.time()
-        if current_time - client.cooldowns.get(event.chat_id, 0) > 5: 
-            try:
+        if settings and settings.get('active', False):
+            if time.time() - client.cooldowns.get(event.chat_id, 0) > 5: 
                 async with client.action(event.chat_id, 'typing'): await asyncio.sleep(1.5)
-            except: pass
-
-            pay_info = ""
-            hm = re.search(r'\b[a-fA-F0-9]{64}\b', text)
-            if hm:
-                v, i = await verify_ltc(hm.group(0))
-                pay_info = f"\n[النظام: العميل أرسل إشعار دفع نتيجته: {'تم' if v else 'فشل'} مبلغ {i}]"
-            elif has_img: pay_info = "\n[النظام: العميل أرسل صورة]"
-
-            saved_persona = settings.get('prompt', "أنت تاجر.") if settings else "أنت تاجر."
-            msgs = [
-                {"role": "system", "content": f"{STRICT_RULE}\n\nبياناتك وشخصيتك:\n{saved_persona}\n{pay_info}"},
-                {"role": "user", "content": text if text else "صورة"}
-            ]
-            ai_reply = await ask_smart_ai(msgs)
-            if ai_reply: await event.reply(ai_reply)
-            client.cooldowns[event.chat_id] = current_time
+                
+                pay_info = ""
+                hm = re.search(r'\b[a-fA-F0-9]{64}\b', text)
+                if hm:
+                    v, i = await verify_ltc(hm.group(0))
+                    pay_info = f"\n[فحص الدفع: {'تم' if v else 'فشل'} مبلغ {i}]"
+                elif event.message.photo: pay_info = "\n[العميل أرسل صورة]"
+                
+                msgs = [{"role": "system", "content": f"{STRICT_RULE}\n{settings.get('prompt', '')}\n{pay_info}"}, 
+                        {"role": "user", "content": text or "صورة"}]
+                ai_reply = await ask_smart_ai(msgs)
+                if ai_reply: await event.reply(ai_reply)
+                client.cooldowns[event.chat_id] = time.time()
     except: pass
 
-async def forced_sub_handler(client, event):
+async def safe_join_handler(client, event):
+    """ الانضمام الآمن: ينضم فقط إذا كانت الرسالة رداً عليك """
     try:
+        if not (event.is_reply or event.mentioned): return 
+        reply_msg = await event.get_reply_message()
+        me = await client.get_me()
+        if reply_msg.sender_id != me.id: return # تجاهل إذا لم يرد عليك
+
         if any(x in event.raw_text.lower() for x in ["join", "اشترك"]):
             links = re.findall(r'(https?://t\.me/[^\s]+)', event.raw_text)
-            for l in links: await process_temp_join(client, l)
+            for l in links: 
+                try:
+                    if "+" in l: await client(ImportChatInviteRequest(l.split("+")[-1]))
+                    else: await client(JoinChannelRequest(l))
+                except: pass
             if event.message.buttons:
                 for row in event.message.buttons:
                     for b in row:
-                        if b.url: await process_temp_join(client, b.url)
+                        if b.url: 
+                            try: await client(JoinChannelRequest(b.url)) 
+                            except: pass
                         else: 
-                            await asyncio.sleep(2)
                             try: await b.click()
                             except: pass
     except: pass
 
-async def process_temp_join(client, link):
-    try:
-        link = link.strip()
-        cid = 0
-        if "+" in link or "joinchat" in link:
-            h = link.split("+")[-1].replace("https://t.me/joinchat/", "")
-            u = await client(ImportChatInviteRequest(h))
-            cid = u.chats[0].id
-        else:
-            link = link.replace('@', '').replace('https://t.me/', '')
-            await client(JoinChannelRequest(link))
-            en = await client.get_entity(link)
-            cid = en.id
-        if cid: await subs_col.update_one({"owner_id": client.owner_id, "chat_id": cid}, {"$set": {"join_time": time.time()}}, upsert=True)
-    except: pass
+# ==========================================
+#      7. ⚔️ نظام النشر الحربي (Sniper Logic)
+# ==========================================
 
-# ==========================================
-#      8. المهام الخلفية
-# ==========================================
-async def global_auto_leave():
+# --- الرادار (فحص المشرفين) ---
+async def check_admin_danger(client, owner_id):
+    danger = False
+    try:
+        cursor = admins_watch_col.find({"owner_id": owner_id})
+        async for doc in cursor:
+            try:
+                entity = await client.get_entity(doc['username'])
+                if isinstance(entity.status, (UserStatusOnline, UserStatusRecently)):
+                    danger = True; break 
+            except: pass
+    except: pass
+    return danger
+
+# --- المحرك ---
+async def autopost_engine(client, owner_id):
+    print(f"🚀 War Engine Started for {owner_id}")
     while True:
-        try:
-            now = time.time()
-            async for d in subs_col.find({}):
-                if now - d['join_time'] > 86400:
-                    try: await active_clients[d['owner_id']](LeaveChannelRequest(d['chat_id']))
+        config = await config_col.find_one({"owner_id": owner_id})
+        if not config or not config.get('active', False): break 
+
+        target_groups = config['groups']
+        for chat_id in target_groups:
+            # 1. هل الجروب مجمد؟
+            if await blacklist_col.find_one({"owner_id": owner_id, "chat_id": chat_id}): continue 
+            
+            # 2. هل الرادار يكشف خطر؟
+            if await check_admin_danger(client, owner_id):
+                # حذف آخر رسالة واختفاء 5 دقائق
+                last_msg_id = LAST_MSG_IDS.get(f"{owner_id}_{chat_id}")
+                if last_msg_id:
+                    try: await client.delete_messages(chat_id, [last_msg_id])
                     except: pass
-                    await subs_col.delete_one({"_id": d['_id']})
-        except: pass
-        await asyncio.sleep(3600)
+                await asyncio.sleep(300)
+                continue 
+            
+            # 3. النشر
+            try:
+                sent = await client.send_message(int(chat_id), config['message'])
+                LAST_MSG_IDS[f"{owner_id}_{chat_id}"] = sent.id
+                await asyncio.sleep(3)
+            except: pass
+        
+        await asyncio.sleep(config['interval'] * 60)
 
-async def run_bc(client, msg, obj, trg):
-    s = 0
+# --- تجميد الاشتباك (عند رد الأدمن) ---
+async def admin_reply_monitor(client, event):
     try:
-        async for d in client.iter_dialogs():
-            ok = (trg=="groups" and d.is_group) or (trg=="private" and d.is_user and not d.entity.bot)
-            if ok:
-                try: await client.send_message(d.id, obj); s+=1; await asyncio.sleep(0.5)
-                except: pass
+        if not event.is_group or not event.is_reply: return
+        me = await client.get_me()
+        reply = await event.get_reply_message()
+        if reply.sender_id != me.id: return
+        
+        sender = await event.get_sender()
+        perms = await client.get_permissions(event.chat_id, sender)
+        if perms.is_admin or perms.is_creator:
+            # تجميد وحفظ هوية المشرف
+            await blacklist_col.update_one(
+                {"owner_id": client.owner_id, "chat_id": event.chat_id},
+                {"$set": {"reason": "AdminReply", "admin_id": sender.id, "ts": time.time()}},
+                upsert=True
+            )
+            await client.send_message("me", f"⛔ **تم تجميد الجروب:** {event.chat.title}\n👮 المشرف: {sender.id}\n💡 **الحل:** رد على هذا المشرف لفك الحظر.")
     except: pass
-    await msg.reply(f"✅ تم النشر: {s}")
 
+# --- فك الاشتباك (عند ردك على المشرف) ---
+async def owner_reply_resume_handler(client, event):
+    try:
+        if not event.is_group or not event.is_reply: return
+        owner_id = client.owner_id
+        chat_id = event.chat_id
+        
+        frozen = await blacklist_col.find_one({"owner_id": owner_id, "chat_id": chat_id})
+        if not frozen: return
+        
+        reply_msg = await event.get_reply_message()
+        if reply_msg.sender_id == frozen.get('admin_id'):
+            # إصابة دقيقة ✅
+            await blacklist_col.delete_one({"owner_id": owner_id, "chat_id": chat_id})
+            await client.send_message("me", f"✅ **تم استئناف النشر!** لقد رديت على المشرف.")
+    except: pass
+
+# ==========================================
+#      8. مهام البحث (Task Sniper)
+# ==========================================
 async def run_task(client, msg, h, k, r, delay):
     c = 0
     lim = time.time() - (h*3600)
-    # 🆕 قائمة لتتبع من تم الرد عليهم في هذه المهمة فقط
-    replied_users_this_task = set()
-    
+    replied_users = set() # Anti-Spam (رد واحد لكل شخص)
     try:
         me = await client.get_me()
         async for d in client.iter_dialogs(limit=None):
             if d.is_group:
                 async for m in client.iter_messages(d.id, limit=20, search=k):
                     if m.date.timestamp() > lim and m.sender_id != me.id:
-                        # 🆕 --- المنطق الجديد (رد واحد لكل مستخدم) ---
-                        if m.sender_id in replied_users_this_task:
-                            continue # تجاهل إذا رددنا عليه سابقاً في هذه المهمة
-                        
+                        if m.sender_id in replied_users: continue 
                         try: 
                             await client.send_message(d.id, r, reply_to=m.id)
-                            c+=1
-                            replied_users_this_task.add(m.sender_id) # تسجيل المستخدم
-                            await asyncio.sleep(delay)
+                            replied_users.add(m.sender_id)
+                            c+=1; await asyncio.sleep(delay)
                         except: pass
     except: pass
-    await msg.reply(f"✅ تم الرد: {c}")
-
-async def clean_acc(client, msg):
-    c=0
-    async for d in client.iter_dialogs():
-        if isinstance(d.entity, User) and d.entity.deleted:
-            try: await client.delete_dialog(d.id); c+=1
-            except: pass
-    await msg.edit(f"✅ حذف: {c}")
-
-async def get_stats(client):
-    try:
-        d = await client.get_dialogs()
-        return f"📊 محادثات: {len(d)}"
-    except: return "خطأ"
+    await msg.reply(f"✅ انتهت المهمة. تم الرد على: {c}")
 
 # ==========================================
 #      9. القائمة والتفاعل
@@ -380,21 +356,17 @@ async def start_handler(event):
 async def show_menu(event):
     cid = event.chat_id
     if cid in active_clients and await active_clients[cid].is_user_authorized():
-        s = await ai_settings_col.find_one({"owner_id": cid})
-        act = s.get('active', False) if s else False
-        btn_text = "🟢 الذكاء يعمل" if act else "🔴 الذكاء متوقف"
-        btn_data = b"ai_off" if act else b"ai_on"
+        conf = await config_col.find_one({"owner_id": cid})
+        st_pub = "🟢" if conf and conf.get('active') else "🔴"
+        
         btns = [
-            [Button.inline(btn_text, btn_data)],
-            [Button.inline("🕵️‍♂️ استنساخ (405B)", b"deep_scan")],
-            [Button.inline("🗣️ نقاش لتدريب البوت", b"consult"), Button.inline("💰 فحص LTC", b"chk_pay")],
-            [Button.inline("📢 نشر للجروبات", b"bc_groups"), Button.inline("📢 نشر للخاص", b"bc_private")],
-            [Button.inline("🚀 مهام بحث", b"task"), Button.inline("⏳ انضمام مؤقت", b"join")],
-            [Button.inline("📊 إحصائيات", b"stats"), Button.inline("🧹 تنظيف", b"clean")],
-            [Button.inline("➕ إضافة رد", b"add_rep"), Button.inline("📋 الردود", b"list_rep")],
-            [Button.inline("🗑️ حذف رد", b"del_rep"), Button.inline("ℹ️ معلومات", b"info")]
+            [Button.inline(f"النشر الحربي {st_pub}", b"menu_autopost"), Button.inline("🕵️‍♂️ الرادار", b"watch_admin_menu")],
+            [Button.inline("🚀 مهام البحث", b"task"), Button.inline("🤖 الذكاء", b"toggle_ai")],
+            [Button.inline("➕ رد تلقائي", b"add_rep"), Button.inline("🎭 تفاعل", b"add_react")],
+            [Button.inline("🗑️ حذف رد", b"del_rep"), Button.inline("❄️ المجمدة", b"show_blacklist")],
+            [Button.inline("📊 الحالة", b"stats")]
         ]
-        await event.respond("✅ **لوحة التحكم (SambaNova Llama 405B)**\n🚀 أذكى نموذج مجاني في العالم حالياً.", buttons=btns)
+        await event.respond("⚔️ **نظام التاجر الحربي (Full Version)**", buttons=btns)
     else:
         await event.respond("👋", buttons=[[Button.inline("🔐 دخول", b"login")]])
 
@@ -403,59 +375,53 @@ async def callback_handler(event):
     cid = event.chat_id
     data = event.data
     cli = active_clients.get(cid)
+    
     if data == b"login":
         USER_STATE[cid] = "SESS"
         await event.respond("🔐 **كود الجلسة:**")
-    elif data == b"ai_on":
-        await ai_settings_col.update_one({"owner_id": cid}, {"$set": {"active": True}}, upsert=True)
-        await show_menu(event)
-    elif data == b"ai_off":
-        await ai_settings_col.update_one({"owner_id": cid}, {"$set": {"active": False}}, upsert=True)
-        await show_menu(event)
-    elif data == b"deep_scan":
-        if not cli: return
-        msg = await event.respond("🚀 **بدأ التحليل بالذكاء الخارق...**")
-        asyncio.create_task(perform_ultimate_analysis(cli, cid, msg))
-    elif data == b"consult":
-        USER_STATE[cid] = "CONSULT"
-        AI_CONTEXT[cid] = [{"role": "system", "content": "أنت خبير تطوير أعمال. قم بإجراء مقابلة مع المستخدم (التاجر) لفهم منتجاته وأسعاره. اسأل سؤالاً واحداً في كل مرة."}]
-        first_q = await ask_smart_ai(AI_CONTEXT[cid])
-        AI_CONTEXT[cid].append({"role": "assistant", "content": first_q})
-        await event.respond(f"🗣️ **بدء جلسة التدريب والمناقشة**\n\n{first_q}\n\n(لإنهاء وحفظ المناقشة اكتب: **تم**)")
-    elif data == b"chk_pay":
-        USER_STATE[cid] = "TX"
-        await event.respond("💰 **الهاش:**")
-    elif data == b"bc_groups":
-        USER_STATE[cid] = "BC_GROUP"
-        await event.respond("📢 **رسالة الجروبات:**")
-    elif data == b"bc_private":
-        USER_STATE[cid] = "BC_PRIVATE"
-        await event.respond("📢 **رسالة الخاص:**")
-    elif data == b"task":
-        USER_STATE[cid] = "TASK_H"
-        TASK_DATA[cid] = {}
-        await event.respond("1️⃣ الساعات؟")
-    elif data == b"join":
-        USER_STATE[cid] = "JOIN"
-        await event.respond("⏳ الرابط:")
+
+    # --- القوائم الفرعية ---
+    elif data == b"menu_autopost":
+        btns = [[Button.inline("⚙️ إعداد جديد", b"setup_autopost"), Button.inline("🟢/🔴 تشغيل/إيقاف", b"toggle_autopost")]]
+        await event.respond("📢 **إعدادات النشر:**", buttons=btns)
+        
+    elif data == b"setup_autopost":
+        AUTO_POST_CONFIG[cid] = {}
+        USER_STATE[cid] = "SET_MSG"
+        await event.respond("📝 **أرسل الرسالة:**")
+        
+    elif data == b"toggle_autopost":
+        conf = await config_col.find_one({"owner_id": cid})
+        new_st = not conf.get('active', False) if conf else False
+        if not conf: return await event.respond("❌ لا توجد إعدادات!")
+        await config_col.update_one({"owner_id": cid}, {"$set": {"active": new_st}}, upsert=True)
+        if new_st: asyncio.create_task(autopost_engine(cli, cid))
+        await event.respond(f"الحالة: {'🟢' if new_st else '🔴'}")
+
+    elif data == b"watch_admin_menu":
+        s = "**👮 المراقبين:**\n"
+        async for doc in admins_watch_col.find({"owner_id": cid}): s += f"- @{doc['username']}\n"
+        btns = [[Button.inline("➕ إضافة", b"add_watch"), Button.inline("🗑️ حذف", b"del_watch")]]
+        await event.respond(s, buttons=btns)
+        
+    elif data == b"add_watch": USER_STATE[cid] = "ADD_ADMIN"; await event.respond("اليوزر (بدون @):")
+    elif data == b"del_watch": USER_STATE[cid] = "DEL_ADMIN"; await event.respond("اليوزر:")
+
+    elif data == b"task": USER_STATE[cid] = "TASK_H"; TASK_DATA[cid] = {}; await event.respond("1️⃣ الساعات؟")
+    elif data == b"add_rep": USER_STATE[cid] = "ADD_KEY"; await event.respond("الكلمة:")
+    elif data == b"del_rep": USER_STATE[cid] = "DEL_KEY"; await event.respond("الكلمة:")
+    elif data == b"add_react": USER_STATE[cid] = "ADD_REACT_KEY"; await event.respond("الكلمة:")
+    
+    elif data == b"show_blacklist":
+        s = "**❄️ الجروبات المجمدة:**\n"
+        async for doc in blacklist_col.find({"owner_id": cid}): s += f"- Chat: `{doc['chat_id']}` (Admin: {doc.get('admin_id')})\n"
+        await event.respond(s or "✅ نظيف", buttons=[[Button.inline("فك الكل", b"clear_bl")]])
+    elif data == b"clear_bl":
+        await blacklist_col.delete_many({"owner_id": cid})
+        await event.respond("✅ تم.")
+        
     elif data == b"stats":
-        msg = await get_stats(cli)
-        await event.respond(msg)
-    elif data == b"clean":
-        m = await event.respond("🧹...")
-        asyncio.create_task(clean_acc(cli, m))
-    elif data == b"add_rep":
-        USER_STATE[cid] = "ADD_KEY"
-        await event.respond("📝 **الكلمة:**")
-    elif data == b"list_rep":
-        s="**📋 الردود:**\n"
-        async for d in replies_col.find({"owner_id": cid}): s+=f"- `{d['keyword']}`\n"
-        await event.respond(s)
-    elif data == b"del_rep":
-        USER_STATE[cid] = "DEL_KEY"
-        await event.respond("🗑️ **الكلمة:**")
-    elif data == b"info":
-        await event.respond("🤖 **Model:** Llama 3.1 405B (SambaNova)\n✅ **Status:** Super Intelligent")
+        if cli: d = await cli.get_dialogs(); await event.respond(f"📊 المحادثات: {len(d)}")
 
 @bot.on(events.NewMessage)
 async def input_handler(event):
@@ -463,91 +429,85 @@ async def input_handler(event):
     txt = event.text.strip()
     st = USER_STATE.get(cid)
     if not st or txt.startswith('/'): return
+    
     if st == "SESS":
         if await start_userbot(cid, txt):
             await sessions_col.update_one({"_id": cid}, {"$set": {"session_string": txt}}, upsert=True)
-            await event.respond("✅")
-            await show_menu(event)
+            await event.respond("✅"); await show_menu(event)
         else: await event.respond("❌")
         USER_STATE[cid] = None
-    elif st == "CONSULT":
-        if txt == "تم" or txt == "انتهى":
-            await event.respond("⏳ **جاري تلخيص المناقشة وحفظ شخصية البوت...**")
-            AI_CONTEXT[cid].append({"role": "user", "content": "تم. الآن بناءً على كل نقاشنا السابق، اكتب System Prompt نهائي وشامل يمثلني كتاجر، يتضمن كل الأسعار والخدمات."})
-            final_save = await ask_smart_ai(AI_CONTEXT[cid])
-            if final_save:
-                await ai_settings_col.update_one({"owner_id": cid}, {"$set": {"prompt": final_save}}, upsert=True)
-                await event.respond(f"✅ **تم الحفظ!**\n\nالبوت الآن جاهز ويعرف كل التفاصيل.\n`{final_save[:200]}...`")
-            else: await event.respond("❌ حدث خطأ أثناء الحفظ.")
-            USER_STATE[cid] = None
-            AI_CONTEXT[cid] = []
-        else:
-            async with bot.action(cid, 'typing'):
-                AI_CONTEXT[cid].append({"role": "user", "content": txt})
-                ai_response = await ask_smart_ai(AI_CONTEXT[cid])
-                if ai_response:
-                    AI_CONTEXT[cid].append({"role": "assistant", "content": ai_response})
-                    await event.reply(ai_response)
-    elif st == "TX":
-        v, i = await verify_ltc(txt)
-        await event.respond(f"{'✅' if v else '❌'} {i}")
-        USER_STATE[cid] = None
-    elif st == "BC_GROUP":
-        m = await event.respond("🚀...")
-        asyncio.create_task(run_bc(active_clients[cid], m, event.message, "groups"))
-        USER_STATE[cid] = None
-    elif st == "BC_PRIVATE":
-        m = await event.respond("🚀...")
-        asyncio.create_task(run_bc(active_clients[cid], m, event.message, "private"))
-        USER_STATE[cid] = None
-    elif st == "JOIN":
-        m = await event.respond("⏳...")
-        asyncio.create_task(process_temp_join(active_clients[cid], txt))
-        USER_STATE[cid] = None
-    elif st == "ADD_KEY":
-        TASK_DATA[cid] = {"k": txt}
-        USER_STATE[cid] = "VAL"
-        await event.respond("📝 **الرد:**")
+
+    # --- النشر ---
+    elif st == "SET_MSG":
+        AUTO_POST_CONFIG[cid]['msg'] = txt; USER_STATE[cid] = "SET_TIME"
+        await event.respond("⏱️ الدقائق؟")
+    elif st == "SET_TIME":
+        try:
+            AUTO_POST_CONFIG[cid]['time'] = int(txt); USER_STATE[cid] = "SEL_GROUPS"
+            cli = active_clients.get(cid)
+            my_groups = []
+            async for d in cli.iter_dialogs(limit=30):
+                if d.is_group: my_groups.append([Button.inline(d.name[:20], f"p_sel_{d.id}")])
+            my_groups.append([Button.inline("✅ حفظ", "save_post")])
+            AUTO_POST_CONFIG[cid]['groups'] = []
+            await event.respond("اختر الجروبات:", buttons=my_groups)
+        except: pass
+
+    # --- الأدوات ---
+    elif st == "ADD_ADMIN":
+        await admins_watch_col.update_one({"owner_id": cid, "username": txt.replace("@","")}, {"$set": {"ts": time.time()}}, upsert=True)
+        await event.respond("✅"); USER_STATE[cid] = None
+    elif st == "DEL_ADMIN":
+        await admins_watch_col.delete_one({"owner_id": cid, "username": txt.replace("@","")})
+        await event.respond("🗑️"); USER_STATE[cid] = None
+        
+    # --- المهام ---
+    elif st == "ADD_KEY": TASK_DATA[cid] = {"k": txt}; USER_STATE[cid] = "VAL"; await event.respond("الرد:")
     elif st == "VAL":
         await replies_col.update_one({"owner_id": cid, "keyword": TASK_DATA[cid]["k"]}, {"$set": {"reply": txt}}, upsert=True)
-        await event.respond("✅")
-        USER_STATE[cid] = None
-    elif st == "DEL_KEY":
-        await replies_col.delete_one({"owner_id": cid, "keyword": txt})
-        await event.respond("🗑️")
-        USER_STATE[cid] = None
+        await event.respond("✅"); USER_STATE[cid] = None
+        
+    elif st == "ADD_REACT_KEY": TASK_DATA[cid] = {"k": txt}; USER_STATE[cid] = "ADD_REACT_EMOJI"; await event.respond("الإيموجي:")
+    elif st == "ADD_REACT_EMOJI":
+        await reactions_col.update_one({"owner_id": cid, "keyword": TASK_DATA[cid]["k"]}, {"$set": {"emoji": txt}}, upsert=True)
+        await event.respond("✅"); USER_STATE[cid] = None
+
     elif st == "TASK_H":
-        try:
-            TASK_DATA[cid] = {"h": int(txt)}
-            USER_STATE[cid] = "TK"
-            await event.respond("🔎 **كلمة:**")
-        except: await event.respond("❌ رقم خطأ")
-    elif st == "TK":
-        TASK_DATA[cid]["k"] = txt
-        USER_STATE[cid] = "TR"
-        await event.respond("📝 **الرد:**")
-    elif st == "TR":
-        TASK_DATA[cid]["r"] = event.message
-        USER_STATE[cid] = "TD"
-        await event.respond("⏱️ **ثواني:**")
+        try: TASK_DATA[cid] = {"h": int(txt)}; USER_STATE[cid] = "TK"; await event.respond("الكلمة:")
+        except: pass
+    elif st == "TK": TASK_DATA[cid]["k"] = txt; USER_STATE[cid] = "TR"; await event.respond("الرد:")
+    elif st == "TR": TASK_DATA[cid]["r"] = event.message; USER_STATE[cid] = "TD"; await event.respond("الانتظار (ثواني):")
     elif st == "TD":
         try:
             m = await event.respond("🚀...")
             asyncio.create_task(run_task(active_clients[cid], m, TASK_DATA[cid]["h"], TASK_DATA[cid]["k"], TASK_DATA[cid]["r"], int(txt)))
             USER_STATE[cid] = None
-        except: await event.respond("❌ رقم خطأ")
+        except: pass
+
+@bot.on(events.CallbackQuery(pattern=r'p_sel_'))
+async def post_group_sel(event):
+    cid = event.chat_id; gid = int(event.data.decode().split('_')[2])
+    if 'groups' not in AUTO_POST_CONFIG.get(cid, {}): AUTO_POST_CONFIG[cid]['groups'] = []
+    if gid not in AUTO_POST_CONFIG[cid]['groups']:
+        AUTO_POST_CONFIG[cid]['groups'].append(gid); await event.answer("✅")
+    else:
+        AUTO_POST_CONFIG[cid]['groups'].remove(gid); await event.answer("❌")
+
+@bot.on(events.CallbackQuery(pattern=b'save_post'))
+async def save_post_final(event):
+    cid = event.chat_id; data = AUTO_POST_CONFIG.get(cid)
+    if not data or not data.get('groups'): return await event.respond("❌")
+    await config_col.update_one({"owner_id": cid}, {"$set": {"message": data['msg'], "interval": data['time'], "groups": data['groups'], "active": True}}, upsert=True)
+    cli = active_clients.get(cid); asyncio.create_task(autopost_engine(cli, cid))
+    await event.respond("✅ تم التشغيل"); USER_STATE[cid] = None
 
 async def main():
     await start_web_server()
     await load_all_sessions()
-    asyncio.create_task(global_auto_leave())
-    print("✅ Bot Started (SambaNova Engine)")
+    print("✅ Bot Started (All Features Included)")
     await bot.start(bot_token=BOT_TOKEN)
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
-    try:
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(main())
-    except KeyboardInterrupt: pass
-    except Exception as e: print(f"Error: {e}")
+    try: loop = asyncio.get_event_loop(); loop.run_until_complete(main())
+    except: pass
