@@ -102,7 +102,7 @@ try:
     config_col = db['autopost_config']      # إعدادات النشر التلقائي
     paused_groups_col = db['paused_groups'] # الجروبات المجمدة (بسبب المشرف)
     admins_watch_col = db['admins_watch']   # قائمة المشرفين للمراقبة
-    subs_col = db['subscriptions']          # 🆕 جدول الاشتراكات المؤقتة (للمغادرة لاحقاً)
+    subs_col = db['subscriptions']          # جدول الاشتراكات المؤقتة (للمغادرة لاحقاً)
     
     print("✅ تم الاتصال بقاعدة البيانات بنجاح")
 except Exception as e:
@@ -178,7 +178,7 @@ async def start_userbot(owner_id, session_str):
         # 3. معالج الذكاء الاصطناعي (للخاص)
         client.add_event_handler(lambda e: handler_ai_chat(client, e), events.NewMessage(incoming=True))
         
-        # 4. معالج الانضمام الآمن (Safe Join) - تم تحديثه للصورة
+        # 4. معالج الانضمام الآمن (Safe Join) - نسخة شرسة جداً
         client.add_event_handler(lambda e: handler_safe_join(client, e), events.NewMessage(incoming=True))
         
         # 5. معالج تجميد النشر (عند رد الأدمن)
@@ -288,7 +288,7 @@ async def handler_ai_chat(client, event):
             client.cooldowns[event.chat_id] = time.time()
     except: pass
 
-# --- 4. معالج الانضمام الآمن (Safe Join) - تم تحديثه للصورة ---
+# --- 4. معالج الانضمام الآمن (Safe Join) - نسخة محدثة وموسعة ---
 async def handler_safe_join(client, event):
     try:
         # الشرط: يجب أن تكون الرسالة رداً (Reply) أو منشتاً (Mention)
@@ -302,10 +302,16 @@ async def handler_safe_join(client, event):
 
         text = event.raw_text.lower()
         
-        # الكلمات المفتاحية الموجودة في الصورة (إنجليزي وعربي)
-        triggers = ["join", "اشترك", "subscribe", "subscription", "قناة", "channel"]
+        # الكلمات المفتاحية الموسعة (بناءً على الصورة التي أرسلتها)
+        triggers = [
+            "join", "اشترك", "subscribe", "subscription", "قناة", "channel",
+            "لايمكنك", "غير مشترك", "عليك الاشتراك", "must join", "المجموعة",
+            "group", "بوت", "bot"
+        ]
         
         if any(x in text for x in triggers):
+            print(f"⚠️ كشف رسالة اشتراك إجباري: {text[:50]}...")
+            
             # 1. استخراج الروابط العادية (https://t.me/...)
             links = re.findall(r'(https?://t\.me/[^\s]+)', event.raw_text)
             # 2. استخراج اليوزرات (@username) مثل اللي في الصورة
@@ -313,6 +319,15 @@ async def handler_safe_join(client, event):
             
             all_targets = links + usernames
             
+            # البحث عن الروابط في الأزرار أيضاً (مهم جداً للبوتات مثل Red bull)
+            if event.message.buttons:
+                for row in event.message.buttons:
+                    for btn in row:
+                        if btn.url:
+                            if "t.me" in btn.url:
+                                all_targets.append(btn.url)
+            
+            # تنفيذ الاشتراك
             for target in all_targets:
                 try:
                     # تنظيف الهدف
@@ -324,29 +339,23 @@ async def handler_safe_join(client, event):
                         await client(JoinChannelRequest(final_target))
                     
                     # حفظ الاشتراك في قاعدة البيانات للمغادرة بعد 24 ساعة
-                    chat_entity = await client.get_entity(final_target)
+                    # نحاول نجيب الآيدي للحفظ
+                    try:
+                        chat_entity = await client.get_entity(final_target)
+                        chat_id_to_save = chat_entity.id
+                    except:
+                        chat_id_to_save = final_target # نحفظ اليوزر اذا فشل جلب الآيدي
+
                     await subs_col.update_one(
-                        {"owner_id": client.owner_id, "chat_id": chat_entity.id},
+                        {"owner_id": client.owner_id, "chat_id": chat_id_to_save},
                         {"$set": {"join_time": time.time()}},
                         upsert=True
                     )
                     
-                    # طباعة للتأكيد
                     print(f"✅ تم الاشتراك الإجباري في: {final_target}")
                     
                 except Exception as e:
                     print(f"❌ فشل الاشتراك في {target}: {e}")
-            
-            # التعامل مع الأزرار الشفافة
-            if event.message.buttons:
-                for row in event.message.buttons:
-                    for btn in row:
-                        if btn.url:
-                            try: await client(JoinChannelRequest(btn.url))
-                            except: pass
-                        else:
-                            try: await btn.click()
-                            except: pass
     except: pass
 
 # --- 5. معالج تجميد النشر (Admin Freeze) ---
@@ -487,8 +496,13 @@ async def auto_leave_engine(client, owner_id):
                 join_time = doc.get('join_time', 0)
                 if now - join_time > 86400:
                     try:
-                        await client(LeaveChannelRequest(doc['chat_id']))
-                        print(f"🚪 مغادرة تلقائية من: {doc['chat_id']}")
+                        chat_id_to_leave = doc['chat_id']
+                        # محاولة التعامل مع الآيدي سواء كان رقم أو نص
+                        try: chat_id_to_leave = int(chat_id_to_leave)
+                        except: pass
+                        
+                        await client(LeaveChannelRequest(chat_id_to_leave))
+                        print(f"🚪 مغادرة تلقائية من: {chat_id_to_leave}")
                         # حذف من القاعدة
                         await subs_col.delete_one({"_id": doc['_id']})
                     except Exception as e:
@@ -552,7 +566,8 @@ async def show_main_menu(event):
             [Button.inline("👮 رادار المشرفين", b"menu_radar"), Button.inline("⛔ الجروبات المتوقفة", b"menu_paused")],
             [Button.inline("🚀 مهام البحث", b"menu_task"), Button.inline(f"🤖 الذكاء {status_ai}", b"toggle_ai")],
             [Button.inline("➕ إضافة رد", b"add_rep"), Button.inline("🎭 إضافة تفاعل", b"add_react")],
-            [Button.inline("🗑️ حذف (رد/تفاعل)", b"menu_del"), Button.inline("📊 الإحصائيات", b"stats")]
+            [Button.inline("🗑️ حذف (رد/تفاعل)", b"menu_del"), Button.inline("📊 الإحصائيات", b"stats")],
+            [Button.inline("🚨 اشتراك يدوي (للطوارئ)", b"manual_join")] # 🆕 زر الطوارئ
         ]
         await event.respond("✅ **لوحة التحكم الشاملة (النسخة الكاملة)**\nاختر من القائمة:", buttons=buttons)
     else:
@@ -571,6 +586,11 @@ async def callback_handler(event):
     if data == b"login":
         USER_STATE[cid] = "SESS"
         await event.respond("🔐 **أرسل كود الجلسة (Session String) الآن:**")
+
+    # --- اشتراك يدوي (طوارئ) ---
+    elif data == b"manual_join":
+        USER_STATE[cid] = "MANUAL_JOIN"
+        await event.respond("🆘 **أرسل رابط القناة أو اليوزر (مثلاً @channel) للاشتراك فوراً:**")
 
     # --- قائمة النشر التلقائي ---
     elif data == b"menu_autopost":
@@ -691,6 +711,18 @@ async def input_handler(event):
             await show_main_menu(event)
         else:
             await msg.edit("❌ كود الجلسة غير صالح أو منتهي.")
+        USER_STATE[cid] = None
+
+    # --- اشتراك يدوي (طوارئ) ---
+    elif state == "MANUAL_JOIN":
+        client = active_clients.get(cid)
+        if client:
+            try:
+                target = text.replace("https://t.me/", "").replace("@", "").strip()
+                await client(JoinChannelRequest(target))
+                await event.respond(f"✅ تم الاشتراك في {target} بنجاح!")
+            except Exception as e:
+                await event.respond(f"❌ فشل الاشتراك: {e}")
         USER_STATE[cid] = None
 
     # --- إعداد النشر ---
