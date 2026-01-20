@@ -102,6 +102,7 @@ try:
     config_col = db['autopost_config']      # إعدادات النشر التلقائي
     paused_groups_col = db['paused_groups'] # الجروبات المجمدة (بسبب المشرف)
     admins_watch_col = db['admins_watch']   # قائمة المشرفين للمراقبة
+    subs_col = db['subscriptions']          # 🆕 جدول الاشتراكات المؤقتة (للمغادرة لاحقاً)
     
     print("✅ تم الاتصال بقاعدة البيانات بنجاح")
 except Exception as e:
@@ -177,7 +178,7 @@ async def start_userbot(owner_id, session_str):
         # 3. معالج الذكاء الاصطناعي (للخاص)
         client.add_event_handler(lambda e: handler_ai_chat(client, e), events.NewMessage(incoming=True))
         
-        # 4. معالج الانضمام الآمن (Safe Join)
+        # 4. معالج الانضمام الآمن (Safe Join) - تم تحديثه للصورة
         client.add_event_handler(lambda e: handler_safe_join(client, e), events.NewMessage(incoming=True))
         
         # 5. معالج تجميد النشر (عند رد الأدمن)
@@ -195,6 +196,9 @@ async def start_userbot(owner_id, session_str):
         if saved_config and saved_config.get('active', False):
             asyncio.create_task(autopost_engine(client, owner_id))
             
+        # تشغيل محرك المغادرة التلقائية (الخروج بعد 24 ساعة)
+        asyncio.create_task(auto_leave_engine(client, owner_id))
+
         return True
     except Exception as e:
         print(f"❌ خطأ في تشغيل اليوزربوت: {e}")
@@ -284,7 +288,7 @@ async def handler_ai_chat(client, event):
             client.cooldowns[event.chat_id] = time.time()
     except: pass
 
-# --- 4. معالج الانضمام الآمن (Safe Join) ---
+# --- 4. معالج الانضمام الآمن (Safe Join) - تم تحديثه للصورة ---
 async def handler_safe_join(client, event):
     try:
         # الشرط: يجب أن تكون الرسالة رداً (Reply) أو منشتاً (Mention)
@@ -297,18 +301,43 @@ async def handler_safe_join(client, event):
         if reply_msg.sender_id != me.id: return 
 
         text = event.raw_text.lower()
-        if "join" in text or "اشترك" in text:
+        
+        # الكلمات المفتاحية الموجودة في الصورة (إنجليزي وعربي)
+        triggers = ["join", "اشترك", "subscribe", "subscription", "قناة", "channel"]
+        
+        if any(x in text for x in triggers):
+            # 1. استخراج الروابط العادية (https://t.me/...)
             links = re.findall(r'(https?://t\.me/[^\s]+)', event.raw_text)
-            for link in links:
-                try:
-                    if "+" in link:
-                        hash_code = link.split("+")[-1]
-                        await client(ImportChatInviteRequest(hash_code))
-                    else:
-                        await client(JoinChannelRequest(link))
-                except: pass
+            # 2. استخراج اليوزرات (@username) مثل اللي في الصورة
+            usernames = re.findall(r'(@[a-zA-Z0-9_]{4,})', event.raw_text)
             
-            # التعامل مع الأزرار
+            all_targets = links + usernames
+            
+            for target in all_targets:
+                try:
+                    # تنظيف الهدف
+                    final_target = target.replace("https://t.me/", "").replace("@", "").strip()
+                    
+                    if "+" in final_target: # رابط دعوة خاص
+                         await client(ImportChatInviteRequest(final_target.split("+")[-1]))
+                    else: # يوزرنيم أو رابط عام
+                        await client(JoinChannelRequest(final_target))
+                    
+                    # حفظ الاشتراك في قاعدة البيانات للمغادرة بعد 24 ساعة
+                    chat_entity = await client.get_entity(final_target)
+                    await subs_col.update_one(
+                        {"owner_id": client.owner_id, "chat_id": chat_entity.id},
+                        {"$set": {"join_time": time.time()}},
+                        upsert=True
+                    )
+                    
+                    # طباعة للتأكيد
+                    print(f"✅ تم الاشتراك الإجباري في: {final_target}")
+                    
+                except Exception as e:
+                    print(f"❌ فشل الاشتراك في {target}: {e}")
+            
+            # التعامل مع الأزرار الشفافة
             if event.message.buttons:
                 for row in event.message.buttons:
                     for btn in row:
@@ -375,8 +404,10 @@ async def handler_owner_resume(client, event):
     except: pass
 
 # ==================================================================
-#                       8. محرك النشر الحربي (Autopost Engine)
+#                       8. محركات الخلفية (Engines)
 # ==================================================================
+
+# --- محرك النشر الحربي (Autopost Engine) ---
 async def check_admin_online_radar(client, owner_id):
     """ فحص هل أحد المشرفين المراقبين متصل الآن؟ """
     is_danger = False
@@ -402,7 +433,6 @@ async def autopost_engine(client, owner_id):
             # 1. جلب الإعدادات
             config = await config_col.find_one({"owner_id": owner_id})
             if not config or not config.get('active', False):
-                # إذا تم تعطيله، نوقف الحلقة
                 print(f"🛑 توقف النشر للمستخدم {owner_id}")
                 break 
 
@@ -427,8 +457,7 @@ async def autopost_engine(client, owner_id):
                         try: await client.delete_messages(chat_id, [last_msg])
                         except: pass
                     
-                    # توقف مؤقت (5 دقائق) قبل المحاولة التالية
-                    await asyncio.sleep(300)
+                    await asyncio.sleep(300) # توقف 5 دقائق
                     continue 
                 
                 # ج. النشر الآمن
@@ -436,7 +465,6 @@ async def autopost_engine(client, owner_id):
                     sent_msg = await client.send_message(int(chat_id), msg_content)
                     # حفظ الرسالة للحذف عند الطوارئ
                     LAST_MSG_IDS[f"{owner_id}_{chat_id}"] = sent_msg.id
-                    # انتظار بسيط بين كل جروب (3 ثواني) لتجنب الحظر
                     await asyncio.sleep(3)
                 except Exception as e:
                     print(f"خطأ في النشر {chat_id}: {e}")
@@ -448,9 +476,27 @@ async def autopost_engine(client, owner_id):
             print(f"خطأ في محرك النشر: {e}")
             await asyncio.sleep(60)
 
-# ==================================================================
-#                       9. محرك مهام البحث (Tasks)
-# ==================================================================
+# --- محرك المغادرة التلقائية (Auto Leave) ---
+async def auto_leave_engine(client, owner_id):
+    """ فحص القنوات المشترك بها مؤقتاً ومغادرتها بعد 24 ساعة """
+    while True:
+        try:
+            now = time.time()
+            # البحث عن الاشتراكات التي مر عليها 24 ساعة (86400 ثانية)
+            async for doc in subs_col.find({"owner_id": owner_id}):
+                join_time = doc.get('join_time', 0)
+                if now - join_time > 86400:
+                    try:
+                        await client(LeaveChannelRequest(doc['chat_id']))
+                        print(f"🚪 مغادرة تلقائية من: {doc['chat_id']}")
+                        # حذف من القاعدة
+                        await subs_col.delete_one({"_id": doc['_id']})
+                    except Exception as e:
+                        print(f"فشل المغادرة: {e}")
+        except: pass
+        await asyncio.sleep(3600) # فحص كل ساعة
+
+# --- محرك مهام البحث (Tasks) ---
 async def run_task_engine(client, status_msg, hours, keyword, reply_msg, delay):
     """ البحث عن رسائل والرد عليها """
     count = 0
@@ -789,7 +835,7 @@ async def save_post_handler(event):
 async def main():
     await start_web_server()
     await load_all_sessions()
-    print("✅ تم تشغيل البوت بنجاح (النسخة الكاملة)")
+    print("✅ تم تشغيل البوت بنجاح (النسخة الكاملة المفصلة)")
     await bot.start(bot_token=BOT_TOKEN)
     await bot.run_until_disconnected()
 
