@@ -7,13 +7,17 @@ import re
 import traceback
 from datetime import datetime
 
-# مكتبات التعامل مع معرفات قاعدة البيانات
+# ==============================================================================
+#                               استيراد المكتبات
+# ==============================================================================
+
+# مكتبات التعامل مع معرفات قاعدة البيانات (للحذف الدقيق)
 from bson.objectid import ObjectId
 
-# مكتبات قاعدة البيانات
+# مكتبات قاعدة البيانات (MongoDB Driver)
 from motor.motor_asyncio import AsyncIOMotorClient
 
-# مكتبات التيليجرام
+# مكتبات التيليجرام (Telethon)
 from telethon import TelegramClient, events, Button, functions, types
 from telethon.sessions import StringSession
 from telethon.tl.types import UserStatusOnline, UserStatusRecently
@@ -27,74 +31,86 @@ from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 # ==============================================================================
-#                               1. إعدادات النظام
+#                               1. إعدادات النظام والبيئة
 # ==============================================================================
+
+# تحميل المتغيرات من ملف .env
 load_dotenv()
 
-# إعداد السجلات (Logs) بشكل واضح
+# إعداد السجلات (Logs) بشكل واضح ومفصل
 logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='[%(asctime)s] %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-logger = logging.getLogger("SaudiMerchantBot_Final")
+logger = logging.getLogger("SaudiMerchantBot_Ultimate")
 
-# جلب المتغيرات
+# جلب المتغيرات من النظام
 API_ID_RAW = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 SAMBANOVA_API_KEY = os.getenv("SAMBANOVA_API_KEY", "key")
 
-if not all([API_ID_RAW, API_HASH, BOT_TOKEN, MONGO_URI]):
-    logger.critical("❌ خطأ: بعض المتغيرات مفقودة في ملف .env")
+# التحقق من وجود جميع المتغيرات الضرورية
+if not API_ID_RAW or not API_HASH or not BOT_TOKEN or not MONGO_URI:
+    logger.critical("❌ خطأ قاتل: أحد المتغيرات الأساسية مفقود. تأكد من إعدادات Render.")
     sys.exit(1)
 
-API_ID = int(API_ID_RAW)
+# تحويل API_ID إلى رقم صحيح
+try:
+    API_ID = int(API_ID_RAW)
+except ValueError:
+    logger.critical("❌ خطأ: API_ID يجب أن يكون رقماً.")
+    sys.exit(1)
 
-# إعداد الذكاء الاصطناعي
+# إعداد عميل الذكاء الاصطناعي (SambaNova)
 try:
     ai_client = AsyncOpenAI(
         base_url="https://api.sambanova.ai/v1",
         api_key=SAMBANOVA_API_KEY
     )
     AI_MODEL = "Meta-Llama-3.1-405B-Instruct"
+    logger.info(f"✅ تم تفعيل الذكاء الاصطناعي: {AI_MODEL}")
 except Exception as e:
+    logger.error(f"⚠️ فشل إعداد الذكاء الاصطناعي: {e}")
     ai_client = None
 
-STRICT_RULE = "أنت تاجر سعودي محترف."
+# تعليمات النظام للشخصية (System Prompt)
+STRICT_RULE = "أنت تاجر سعودي محترف. هدفك البيع وخدمة العميل."
 
 # ==============================================================================
 #                               2. الذاكرة والمتغيرات العامة
 # ==============================================================================
-# تخزين الجلسات النشطة
+
+# تخزين العملاء النشطين (Userbots)
 active_userbot_clients = {}
 
-# تخزين حالة المستخدم الحالية
+# تخزين حالة المستخدم الحالية (لانتظار الإدخال)
 user_current_state = {}
 
 # تخزين بيانات المهام المؤقتة
 temporary_task_data = {}
 
-# تخزين إعدادات النشر المؤقتة
+# تخزين إعدادات النشر التلقائي المؤقتة
 temporary_autopost_config = {}
 
-# تخزين معرفات آخر رسائل منشورة (للحذف)
+# تخزين معرفات آخر رسائل منشورة (لحذفها عند الخطر)
 last_published_message_ids = {}
 
-# تخزين توقيت الردود (لمنع التكرار)
+# تخزين توقيت الردود (لمنع التكرار - Cooldown)
 reply_cooldown_timestamps = {}
 
 # 🔥 تخزين مهام النشر النشطة (لمنع التكرار وقتل المهام القديمة) 🔥
 running_autopost_tasks = {} # {owner_id: asyncio.Task}
 
 # ==============================================================================
-#                               3. قاعدة البيانات
+#                               3. الاتصال بقاعدة البيانات
 # ==============================================================================
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URI)
     database = mongo_client['MyTelegramBotDB']
     
-    # الجداول بأسماء واضحة
+    # تعريف الجداول (Collections) بأسماء واضحة وكاملة
     sessions_collection = database['sessions']
     replies_collection = database['replies']
     ai_settings_collection = database['ai_prompts']
@@ -104,142 +120,190 @@ try:
     subscriptions_collection = database['subscriptions']
     general_settings_collection = database['general_settings']
     
-    print("✅ تم الاتصال بقاعدة البيانات بنجاح")
+    logger.info("✅ تم الاتصال بقاعدة البيانات MongoDB بنجاح.")
 except Exception as e:
+    logger.critical(f"❌ فشل الاتصال بقاعدة البيانات: {e}")
     sys.exit(1)
 
 # ==============================================================================
-#                               4. الخادم والبوت
+#                               4. خادم الويب والبوت الرئيسي
 # ==============================================================================
 bot_client = TelegramClient('bot_session', API_ID, API_HASH)
 
 async def web_request_handler(request):
+    """ صفحة ويب بسيطة لضمان بقاء البوت نشطاً """
     return web.Response(text="Bot is Running Successfully")
 
 async def start_web_server():
+    """ تشغيل خادم الويب """
     app = web.Application()
     app.router.add_get('/', web_request_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', 8080)
     await site.start()
+    logger.info("✅ خادم الويب يعمل.")
 
 async def get_ai_response(messages_list):
-    if not ai_client: return None
+    """ دالة مساعدة لجلب رد الذكاء الاصطناعي """
+    if not ai_client:
+        return None
     try:
         response = await ai_client.chat.completions.create(
             model=AI_MODEL,
             messages=messages_list,
-            temperature=0.7
+            temperature=0.7,
+            top_p=0.9
         )
         return response.choices[0].message.content
-    except: return None
+    except Exception as e:
+        logger.error(f"AI Error: {e}")
+        return None
 
 # ==============================================================================
-#                               5. إدارة اليوزربوت (التشغيل والمهام)
+#                               5. إدارة اليوزربوت (Userbot Management)
 # ==============================================================================
 
 async def start_userbot_session(owner_id, session_string):
+    """
+    وظيفة لتهيئة وتشغيل حساب المستخدم كبوت
+    """
     try:
         # إغلاق الجلسة القديمة إذا كانت موجودة
         if owner_id in active_userbot_clients:
             await active_userbot_clients[owner_id].disconnect()
         
+        # إنشاء عميل جديد
         userbot = TelegramClient(StringSession(session_string), API_ID, API_HASH)
         await userbot.connect()
         
+        # التحقق من الصلاحية
         if not await userbot.is_user_authorized():
+            logger.warning(f"الجلسة منتهية للمستخدم {owner_id}")
             return False
         
         userbot.owner_id = owner_id
         userbot.cooldowns = {} 
 
-        # تسجيل المعالجات (Handlers)
+        # ---------------- تسجيل المعالجات (Handlers) ----------------
+        
+        # 1. معالج الرد التلقائي
         userbot.add_event_handler(
             lambda event: handle_auto_reply(userbot, event),
             events.NewMessage(incoming=True)
         )
+        
+        # 2. معالج الذكاء الاصطناعي
         userbot.add_event_handler(
             lambda event: handle_ai_chat(userbot, event),
             events.NewMessage(incoming=True)
         )
+        
+        # 3. معالج الاشتراك الإجباري الآمن
         userbot.add_event_handler(
             lambda event: handle_safe_forced_join(userbot, event),
             events.NewMessage(incoming=True)
         )
+        
+        # 4. معالج تجميد النشر (عند رد المشرف)
         userbot.add_event_handler(
             lambda event: handle_admin_freeze_trigger(userbot, event),
             events.NewMessage(incoming=True)
         )
+        
+        # 5. معالج فك التجميد (عند رد المالك)
         userbot.add_event_handler(
             lambda event: handle_owner_resume_trigger(userbot, event),
             events.NewMessage(outgoing=True)
         )
         
+        # حفظ العميل
         active_userbot_clients[owner_id] = userbot
+        logger.info(f"✅ تم تشغيل اليوزربوت للمستخدم: {owner_id}")
         
-        # 🔥 إعادة تشغيل النشر التلقائي (مع الحماية من التكرار) 🔥
+        # 🔥 إعادة تشغيل مهمة النشر (بشكل آمن يمنع التكرار) 🔥
         await restart_autopost_task_safe(userbot, owner_id)
         
-        # تشغيل المغادرة التلقائية
+        # تشغيل مهمة المغادرة التلقائية للقنوات
         asyncio.create_task(engine_auto_leave_channels(userbot, owner_id))
             
         return True
     except Exception as e:
+        logger.error(f"Error starting userbot: {e}")
         return False
 
 async def load_all_sessions_from_db():
+    """ تحميل جميع الجلسات عند بدء التشغيل """
+    logger.info("⏳ جاري تحميل الجلسات...")
     async for document in sessions_collection.find({}):
         asyncio.create_task(start_userbot_session(document['_id'], document['session_string']))
 
-# 🔥 دالة الحماية من التكرار (تقتل المهمة القديمة وتبدأ الجديدة) 🔥
+# 🔥 دالة الحماية من التكرار (Task Killer) 🔥
+# هذه الدالة تضمن أنه لا يوجد إلا محرك نشر واحد يعمل للمستخدم
 async def restart_autopost_task_safe(client, owner_id):
-    # 1. قتل المهمة القديمة
+    # 1. هل هناك مهمة قديمة تعمل؟
     if owner_id in running_autopost_tasks:
         old_task = running_autopost_tasks[owner_id]
+        # إلغاء المهمة
         old_task.cancel()
         try:
+            # انتظار حتى تتوقف تماماً
             await old_task
         except asyncio.CancelledError:
             pass
+        # حذفها من القائمة
         del running_autopost_tasks[owner_id]
-        print(f"🛑 تم إيقاف مهمة النشر السابقة للمستخدم {owner_id}")
+        logger.info(f"🛑 تم إيقاف مهمة النشر السابقة للمستخدم {owner_id}")
 
     # 2. التحقق من الإعدادات وبدء المهمة الجديدة
     configuration = await autopost_config_collection.find_one({"owner_id": owner_id})
     if configuration and configuration.get('active', False):
+        # إنشاء مهمة جديدة
         new_task = asyncio.create_task(engine_autopost_loop(client, owner_id))
+        # تسجيلها
         running_autopost_tasks[owner_id] = new_task
-        print(f"🚀 تم تشغيل مهمة نشر جديدة ونظيفة للمستخدم {owner_id}")
+        logger.info(f"🚀 تم تشغيل مهمة نشر جديدة ونظيفة للمستخدم {owner_id}")
 
 # ==============================================================================
-#                               6. المعالجات (Handlers)
+#                               6. المعالجات (Handlers Logic)
 # ==============================================================================
 
+# --- معالج الرد التلقائي ---
 async def handle_auto_reply(client, event):
-    if not (event.is_private or event.is_group): return
+    # يجب أن يكون في الخاص أو مجموعة
+    if not (event.is_private or event.is_group):
+        return
     try:
         user_text = event.raw_text or ""
+        
+        # البحث عن الكلمات المفتاحية
         cursor = replies_collection.find({"owner_id": client.owner_id})
         async for reply_doc in cursor:
             if reply_doc['keyword'] in user_text:
-                # مفتاح الكولدون: (ChatID, SenderID, Keyword)
+                
+                # التحقق من الكولدون (10 دقائق)
                 cooldown_key = (event.chat_id, event.sender_id, reply_doc['keyword'])
                 last_time = reply_cooldown_timestamps.get(cooldown_key, 0)
                 
-                if time.time() - last_time < 600: # 10 دقائق
-                    return
+                if time.time() - last_time < 600:
+                    return # لم يمر الوقت الكافي
                 
+                # تحديث الوقت وإرسال الرد
                 reply_cooldown_timestamps[cooldown_key] = time.time()
                 await event.reply(reply_doc['reply'])
                 return
-    except: pass
+    except Exception as e:
+        pass
 
+# --- معالج الذكاء الاصطناعي ---
 async def handle_ai_chat(client, event):
-    if not event.is_private: return
+    # يعمل في الخاص فقط
+    if not event.is_private:
+        return
     try:
         settings = await ai_settings_collection.find_one({"owner_id": client.owner_id})
         if settings and settings.get('active'):
+            # تأخير بسيط للمحاكاة
             if time.time() - client.cooldowns.get(event.chat_id, 0) > 5:
                 async with client.action(event.chat_id, 'typing'):
                     await asyncio.sleep(2)
@@ -253,32 +317,41 @@ async def handle_ai_chat(client, event):
                     await event.reply(ai_reply)
                 
                 client.cooldowns[event.chat_id] = time.time()
-    except: pass
+    except Exception as e:
+        pass
 
-# اشتراك آمن جداً (فقط عند الرد عليك بكلمات حظر)
+# --- معالج الاشتراك الإجباري الآمن ---
 async def handle_safe_forced_join(client, event):
     try:
-        # شرط 1: لازم تكون رد أو منشن
-        if not (event.is_reply or event.mentioned): return
+        # الشرط 1: يجب أن يكون رداً أو منشناً
+        if not (event.is_reply or event.mentioned):
+            return
         
-        # شرط 2: لازم الرد يكون علي أنا
+        # الشرط 2: الرد موجه لي
         reply_message = await event.get_reply_message()
         my_info = await client.get_me()
-        if reply_message and reply_message.sender_id != my_info.id: return 
+        if reply_message and reply_message.sender_id != my_info.id:
+            return 
 
         text_content = event.raw_text.lower()
+        # الكلمات المفتاحية للحظر
         forced_keywords = ["لايمكنك", "عليك الاشتراك", "must join", "غير مشترك", "join channel", "القناة"]
         
         if any(keyword in text_content for keyword in forced_keywords):
-            targets_to_join = re.findall(r'(https?://t\.me/[^\s]+|@[a-zA-Z0-9_]{4,})', event.raw_text)
+            targets_to_join = []
             
-            # فحص الأزرار
+            # استخراج الروابط من النص
+            links_in_text = re.findall(r'(https?://t\.me/[^\s]+|@[a-zA-Z0-9_]{4,})', event.raw_text)
+            targets_to_join.extend(links_in_text)
+            
+            # استخراج الروابط من الأزرار
             if event.message.buttons:
                 for row in event.message.buttons:
                     for btn in row:
                         if hasattr(btn, 'url') and btn.url and "t.me" in btn.url:
                             targets_to_join.append(btn.url)
             
+            # التنفيذ
             for target_link in targets_to_join:
                 try:
                     clean_link = target_link.replace("https://t.me/", "").replace("@", "").strip()
@@ -303,15 +376,18 @@ async def handle_safe_forced_join(client, event):
                 except: pass
     except: pass
 
+# --- معالج تجميد النشر (عند رد المشرف) ---
 async def handle_admin_freeze_trigger(client, event):
     if not (event.is_group and event.is_reply): return
     try:
         my_info = await client.get_me()
+        # التأكد أن الرد علي
         if (await event.get_reply_message()).sender_id != my_info.id: return
         
         sender = await event.get_sender()
         perms = await client.get_permissions(event.chat_id, sender)
         
+        # إذا كان مشرفاً
         if perms.is_admin or perms.is_creator:
             await paused_groups_collection.update_one(
                 {"owner_id": client.owner_id, "chat_id": event.chat_id},
@@ -321,6 +397,7 @@ async def handle_admin_freeze_trigger(client, event):
             await client.send_message("me", f"⛔ توقف النشر في {event.chat.title} بسبب رد المشرف.")
     except: pass
 
+# --- معالج فك التجميد (عند رد المالك) ---
 async def handle_owner_resume_trigger(client, event):
     if not (event.is_group and event.is_reply): return
     try:
@@ -328,6 +405,7 @@ async def handle_owner_resume_trigger(client, event):
         if not paused_data: return
         
         replied_to_msg = await event.get_reply_message()
+        # إذا رديت على نفس المشرف
         if replied_to_msg.sender_id == paused_data['admin_id']:
             await paused_groups_collection.delete_one({"_id": paused_data['_id']})
             await client.send_message("me", f"✅ عاد النشر في {event.chat.title}")
@@ -348,14 +426,14 @@ async def engine_autopost_loop(client, owner_id):
 
             config = await autopost_config_collection.find_one({"owner_id": owner_id})
             if not config or not config.get('active', False): 
-                break # الخروج من الحلقة إذا تم التعطيل
+                break # خروج من الحلقة
             
             for group_id in config['groups']:
                 # 1. هل الجروب مجمد؟
                 if await paused_groups_collection.find_one({"owner_id": owner_id, "chat_id": group_id}): 
                     continue
                 
-                # 2. فحص الرادار (المشرفين)
+                # 2. فحص الرادار
                 is_danger = False
                 async for admin_doc in admins_watch_collection.find({"owner_id": owner_id}):
                     try:
@@ -377,21 +455,21 @@ async def engine_autopost_loop(client, owner_id):
                 try:
                     sent_message = await client.send_message(int(group_id), config['message'])
                     last_published_message_ids[f"{owner_id}_{group_id}"] = sent_message.id
-                    await asyncio.sleep(5) # انتظار بين الجروبات
+                    await asyncio.sleep(5)
                 except FloodWaitError as f: 
                     await asyncio.sleep(f.seconds)
                 except: pass
             
-            # الانتظار للدورة القادمة
+            # الانتظار
             await asyncio.sleep(config['interval'] * 60)
             
         except asyncio.CancelledError:
-            print(f"تم قتل مهمة النشر للمستخدم {owner_id}")
             break
         except: 
             await asyncio.sleep(60)
 
 async def engine_auto_leave_channels(client, owner_id):
+    """ محرك المغادرة التلقائية """
     while True:
         try:
             current_timestamp = time.time()
@@ -413,18 +491,18 @@ async def engine_broadcast_sender(client, status_message, broadcast_text):
     count_sent = 0
     try:
         async for dialog in client.iter_dialogs():
-            # إرسال للمستخدمين فقط (ليس بوتات وليس جروبات)
             if dialog.is_user and not dialog.entity.bot:
                 try:
                     await client.send_message(dialog.id, broadcast_text)
                     count_sent += 1
-                    await asyncio.sleep(1) # تفادي الحظر
+                    await asyncio.sleep(1)
                 except: pass
     except: pass
     
     await status_message.edit(f"✅ **تم الانتهاء من البرودكاست.**\nتم الإرسال إلى: `{count_sent}` مستخدم.")
 
 async def engine_search_task(client, status_msg, hours, keyword, reply_text, delay):
+    """ محرك البحث والرد (المهام) """
     count = 0
     limit_time = time.time() - (hours * 3600)
     replied_users = set()
@@ -446,7 +524,7 @@ async def engine_search_task(client, status_msg, hours, keyword, reply_text, del
     await status_msg.reply(f"✅ انتهت المهمة. تم الرد على {count} رسالة.")
 
 # ==============================================================================
-#                               8. واجهة المستخدم (القوائم والأزرار)
+#                               8. واجهة المستخدم (UI & Callbacks)
 # ==============================================================================
 
 @bot_client.on(events.NewMessage(pattern='/start'))
@@ -474,6 +552,14 @@ async def callback_handler(event):
     data = event.data
     client = active_userbot_clients.get(chat_id)
 
+    # 🔥 كاشف الصمت: إذا لم يكن هناك عميل، نبه المستخدم 🔥
+    if not client and data != b"login":
+        await event.answer("⚠️ يجب تسجيل الدخول أولاً!", alert=True)
+        return
+
+    # تأكيد الضغطة
+    await event.answer()
+
     if data == b"login":
         user_current_state[chat_id] = "WAITING_SESSION"
         await event.respond("🔐 **أرسل كود الجلسة (Session String):**")
@@ -483,33 +569,31 @@ async def callback_handler(event):
         await event.respond("🧹 **جاري مغادرة القنوات المؤقتة...**")
         asyncio.create_task(engine_auto_leave_channels(client, chat_id))
 
-    # --- إدارة النشر التلقائي (الأزرار المطلوبة) ---
+    # --- إدارة النشر التلقائي ---
     elif data == b"menu_autopost":
-        # جلب الرسالة الحالية
         conf = await autopost_config_collection.find_one({"owner_id": chat_id})
         msg_preview = conf.get('message', 'لا يوجد') if conf else "لا يوجد"
         if len(msg_preview) > 20: msg_preview = msg_preview[:20] + "..."
         
-        text = f"📢 **النشر التلقائي**\nالرسالة الحالية: `{msg_preview}`"
+        text_msg = f"📢 **النشر التلقائي**\nالرسالة: `{msg_preview}`"
         btns = [
             [Button.inline("⚙️ إعداد جديد", b"setup_post")],
             [Button.inline("⏯️ تشغيل/إيقاف", b"toggle_post")],
-            [Button.inline("🗑️ حذف الإعدادات وإيقاف", b"delete_autopost_settings")],
-            [Button.inline("👁️ عرض المنشور الحالي", b"view_current_post")],
+            [Button.inline("🗑️ حذف الإعدادات", b"delete_autopost_settings")],
+            [Button.inline("👁️ عرض المنشور", b"view_current_post")],
             [Button.inline("🔙 رجوع", b"back_home")]
         ]
-        await event.respond(text, buttons=btns)
+        await event.respond(text_msg, buttons=btns)
 
     elif data == b"view_current_post":
         conf = await autopost_config_collection.find_one({"owner_id": chat_id})
         if conf and conf.get('message'):
-            await event.respond(f"📝 **الرسالة المحفوظة:**\n\n{conf['message']}")
+            await event.respond(f"📝 **الرسالة:**\n\n{conf['message']}")
         else:
             await event.respond("❌ لا توجد رسالة محفوظة.")
 
     elif data == b"delete_autopost_settings":
         await autopost_config_collection.delete_one({"owner_id": chat_id})
-        # إيقاف المهمة الحالية فوراً
         if chat_id in running_autopost_tasks:
             running_autopost_tasks[chat_id].cancel()
             del running_autopost_tasks[chat_id]
@@ -522,15 +606,17 @@ async def callback_handler(event):
     elif data == b"toggle_post":
         conf = await autopost_config_collection.find_one({"owner_id": chat_id})
         if not conf:
-            return await event.respond("❌ قم بالإعداد أولاً")
+            await event.respond("❌ قم بالإعداد أولاً")
+            return
         
         new_status = not conf.get('active', False)
         await autopost_config_collection.update_one({"owner_id": chat_id}, {"$set": {"active": new_status}}, upsert=True)
         
-        # إعادة تشغيل المهمة بشكل نظيف (يقتل القديم ويبدأ الجديد)
+        # إعادة تشغيل المهمة بشكل نظيف
         await restart_autopost_task_safe(client, chat_id)
         
-        await event.respond(f"✅ الحالة الآن: {'🟢 يعمل' if new_status else '🔴 متوقف'}")
+        status_text = '🟢 يعمل' if new_status else '🔴 متوقف'
+        await event.respond(f"✅ الحالة الآن: {status_text}")
 
     # --- البرودكاست الخاص ---
     elif data == b"broadcast_menu":
@@ -544,7 +630,7 @@ async def callback_handler(event):
             btns.append([Button.inline(f"🗑️ حذف: {r['keyword']}", f"del_rep_{r['_id']}")])
         btns.append([Button.inline("➕ إضافة رد", b"add_reply")])
         btns.append([Button.inline("🔙 رجوع", b"back_home")])
-        await event.respond("📋 **قائمة الردود:**", buttons=btns)
+        await event.respond("📋 **الردود:**", buttons=btns)
 
     elif data == b"add_reply":
         user_current_state[chat_id] = "WAITING_REPLY_KEY"
@@ -553,8 +639,7 @@ async def callback_handler(event):
     elif data.decode().startswith("del_rep_"):
         reply_id = data.decode().split("_")[2]
         await replies_collection.delete_one({"_id": ObjectId(reply_id)})
-        await event.answer("✅ تم الحذف")
-        await event.respond("تم الحذف.")
+        await event.respond("✅ تم الحذف.")
 
     # --- الرادار ---
     elif data == b"menu_radar":
@@ -600,7 +685,7 @@ async def input_message_handler(event):
 
     # برودكاست
     elif state == "WAITING_BROADCAST_MSG":
-        status_msg = await event.respond("⏳ **جاري بدء البرودكاست...**")
+        status_msg = await event.respond("⏳ **جاري النشر...**")
         asyncio.create_task(engine_broadcast_sender(active_userbot_clients[chat_id], status_msg, user_text))
         user_current_state[chat_id] = None
 
@@ -608,22 +693,20 @@ async def input_message_handler(event):
     elif state == "WAITING_POST_MSG":
         AUTO_POST_CONFIG[chat_id] = {'msg': user_text}
         user_current_state[chat_id] = "WAITING_POST_TIME"
-        await event.respond("⏱️ **كم دقيقة بين النشر؟**")
+        await event.respond("⏱️ **الدقائق:**")
     
     elif state == "WAITING_POST_TIME":
         try:
             AUTO_POST_CONFIG[chat_id]['time'] = int(user_text)
             user_current_state[chat_id] = "WAITING_POST_GROUPS"
             
-            buttons = []
-            client = active_userbot_clients[chat_id]
-            async for dialog in client.iter_dialogs(limit=30): 
-                if dialog.is_group:
-                    buttons.append([Button.inline(dialog.name[:20], f"grp_{dialog.id}")])
-            
-            buttons.append([Button.inline("✅ حفظ وبدء النشر", "save_autopost_final")])
+            btns = []
+            cli = active_userbot_clients[chat_id]
+            async for d in cli.iter_dialogs(limit=30): 
+                if d.is_group: btns.append([Button.inline(d.name[:20], f"grp_{d.id}")])
+            btns.append([Button.inline("✅ حفظ وبدء", "save_autopost_final")])
             AUTO_POST_CONFIG[chat_id]['groups'] = []
-            await event.respond("📂 **اختر الجروبات:**", buttons=buttons)
+            await event.respond("📂 **اختر الجروبات:**", buttons=btns)
         except: pass
 
     # إضافة رد
@@ -665,32 +748,35 @@ async def group_select(event):
     else:
         current_list.remove(group_id)
         await event.answer("❌ تم الإلغاء")
+    
+    AUTO_POST_CONFIG[chat_id]['groups'] = current_list
 
 @bot_client.on(events.CallbackQuery(pattern=b'save_autopost_final'))
 async def save_autopost_final(event):
     chat_id = event.chat_id
-    data = AUTO_POST_CONFIG.get(chat_id)
+    data_config = AUTO_POST_CONFIG.get(chat_id)
     
-    if not data or not data.get('groups'): return await event.respond("❌ اختر جروب")
+    if not data_config or not data_config.get('groups'):
+        await event.answer("❌ اختر جروب", alert=True)
+        return
     
     await autopost_config_collection.update_one(
         {"owner_id": chat_id},
-        {"$set": {"message": data['msg'], "interval": data['time'], "groups": data['groups'], "active": True}},
+        {"$set": {"message": data_config['msg'], "interval": data_config['time'], "groups": data_config['groups'], "active": True}},
         upsert=True
     )
     
-    # تشغيل المهمة الآمنة
     await restart_autopost_task_safe(active_userbot_clients[chat_id], chat_id)
     await event.respond("✅ **تم الحفظ وبدء النشر!**")
     user_current_state[chat_id] = None
 
 # ==============================================================================
-#                               9. التشغيل
+#                               10. التشغيل النهائي
 # ==============================================================================
 async def main():
     await start_web_server()
     await load_all_sessions_from_db()
-    print("✅ Bot Started (Full Clean Version)")
+    print("✅ Bot Started Final Full")
     await bot_client.start(bot_token=BOT_TOKEN)
     await bot_client.run_until_disconnected()
 
