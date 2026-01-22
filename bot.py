@@ -7,97 +7,52 @@ import re
 import traceback
 from datetime import datetime
 
-# ==============================================================================
-#                               استيراد المكتبات (كاملة)
-# ==============================================================================
-
-# للتعامل مع معرفات قاعدة البيانات
+# استيراد المكتبات
 from bson.objectid import ObjectId
-
-# محرك قاعدة البيانات
 from motor.motor_asyncio import AsyncIOMotorClient
-
-# مكتبة تيليجرام (Telethon)
 from telethon import TelegramClient, events, Button, functions, types
 from telethon.sessions import StringSession
 from telethon.tl.types import UserStatusOnline, UserStatusRecently
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
 from telethon.errors import FloodWaitError
-
-# خادم الويب (لإبقاء البوت نشطاً)
 from aiohttp import web
-
-# الذكاء الاصطناعي
 from openai import AsyncOpenAI
-
-# تحميل متغيرات البيئة
 from dotenv import load_dotenv
 
 # ==============================================================================
 #                               1. إعدادات النظام
 # ==============================================================================
-
-# تحميل ملف .env
 load_dotenv()
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger("SaudiMerchantBot_Broadcast_Fixed")
 
-# إعداد السجلات (Logging)
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger("SaudiMerchantBot_Full_NoShortcuts")
-
-# جلب المتغيرات
-API_ID_RAW = os.getenv("API_ID")
+API_ID = int(os.getenv("API_ID") or 0)
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 SAMBANOVA_API_KEY = os.getenv("SAMBANOVA_API_KEY", "key")
 
-# التحقق من المتغيرات
-if not all([API_ID_RAW, API_HASH, BOT_TOKEN, MONGO_URI]):
-    logger.critical("❌ خطأ: البيانات ناقصة في ملف .env")
+if not all([API_ID, API_HASH, BOT_TOKEN, MONGO_URI]):
     sys.exit(1)
 
-API_ID = int(API_ID_RAW)
-
-# إعداد عميل الذكاء الاصطناعي
 try:
-    ai_client = AsyncOpenAI(
-        base_url="https://api.sambanova.ai/v1",
-        api_key=SAMBANOVA_API_KEY
-    )
+    ai_client = AsyncOpenAI(base_url="https://api.sambanova.ai/v1", api_key=SAMBANOVA_API_KEY)
     AI_MODEL = "Meta-Llama-3.1-405B-Instruct"
-except Exception as e:
-    ai_client = None
+except: ai_client = None
 
 STRICT_RULE = "أنت تاجر سعودي محترف."
 
 # ==============================================================================
-#                               2. متغيرات الذاكرة (بدون اختصارات)
+#                               2. الذاكرة
 # ==============================================================================
-
-# قائمة العملاء النشطين (Userbots)
 active_userbot_clients = {}
-
-# حالة المستخدم الحالية (لإدخال البيانات)
 user_current_state = {}
-
-# بيانات المهام المؤقتة
 temporary_task_data = {}
-
-# إعدادات النشر المؤقتة
 temporary_autopost_config = {}
-
-# آيدي آخر رسالة تم نشرها (للحذف عند الخطر)
 last_published_message_ids = {}
-
-# توقيت الردود (لمنع التكرار)
 reply_cooldown_timestamps = {}
-
-# 🔥 قائمة المهام النشطة (لمنع التكرار) 🔥
-running_autopost_tasks = {} # {owner_id: asyncio.Task}
+running_autopost_tasks = {} 
 
 # ==============================================================================
 #                               3. قاعدة البيانات
@@ -105,7 +60,6 @@ running_autopost_tasks = {} # {owner_id: asyncio.Task}
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URI)
     database = mongo_client['MyTelegramBotDB']
-    
     sessions_collection = database['sessions']
     replies_collection = database['replies']
     ai_settings_collection = database['ai_prompts']
@@ -114,11 +68,8 @@ try:
     admins_watch_collection = database['admins_watch']
     subscriptions_collection = database['subscriptions']
     general_settings_collection = database['general_settings']
-    
-    print("✅ تم الاتصال بقاعدة البيانات بنجاح")
-except Exception as e:
-    logger.critical(f"DB Error: {e}")
-    sys.exit(1)
+    print("✅ DB Connected")
+except: sys.exit(1)
 
 # ==============================================================================
 #                               4. الخادم والبوت
@@ -126,7 +77,7 @@ except Exception as e:
 bot_client = TelegramClient('bot_session', API_ID, API_HASH)
 
 async def web_request_handler(request):
-    return web.Response(text="Bot Running OK")
+    return web.Response(text="Bot Running")
 
 async def start_web_server():
     app = web.Application()
@@ -139,34 +90,27 @@ async def start_web_server():
 async def get_ai_response(messages_list):
     if not ai_client: return None
     try:
-        response = await ai_client.chat.completions.create(
-            model=AI_MODEL,
-            messages=messages_list,
-            temperature=0.7
-        )
+        response = await ai_client.chat.completions.create(model=AI_MODEL, messages=messages_list, temperature=0.7)
         return response.choices[0].message.content
     except: return None
 
 # ==============================================================================
-#                               5. إدارة اليوزربوت (Core Logic)
+#                               5. إدارة اليوزربوت
 # ==============================================================================
 
 async def start_userbot_session(owner_id, session_string):
     try:
-        # إغلاق الجلسة السابقة
         if owner_id in active_userbot_clients:
             await active_userbot_clients[owner_id].disconnect()
         
         userbot = TelegramClient(StringSession(session_string), API_ID, API_HASH)
         await userbot.connect()
-        
-        if not await userbot.is_user_authorized():
-            return False
+        if not await userbot.is_user_authorized(): return False
         
         userbot.owner_id = owner_id
         userbot.cooldowns = {} 
 
-        # --- تسجيل جميع المعالجات (Handlers) ---
+        # تسجيل المعالجات
         userbot.add_event_handler(lambda e: handle_auto_reply(userbot, e), events.NewMessage(incoming=True))
         userbot.add_event_handler(lambda e: handle_ai_chat(userbot, e), events.NewMessage(incoming=True))
         userbot.add_event_handler(lambda e: handle_safe_forced_join(userbot, e), events.NewMessage(incoming=True))
@@ -175,10 +119,7 @@ async def start_userbot_session(owner_id, session_string):
         
         active_userbot_clients[owner_id] = userbot
         
-        # استعادة المهام (مع الحماية)
         await restart_autopost_task_safe(userbot, owner_id)
-        
-        # تشغيل المغادرة التلقائية
         asyncio.create_task(engine_auto_leave_channels(userbot, owner_id))
             
         return True
@@ -188,25 +129,15 @@ async def load_all_sessions_from_db():
     async for document in sessions_collection.find({}):
         asyncio.create_task(start_userbot_session(document['_id'], document['session_string']))
 
-# 🔥 دالة منع التكرار (Task Killer) 🔥
 async def restart_autopost_task_safe(client, owner_id):
-    # 1. إيقاف المهمة القديمة
     if owner_id in running_autopost_tasks:
-        old_task = running_autopost_tasks[owner_id]
-        old_task.cancel()
-        try:
-            await old_task
-        except asyncio.CancelledError:
-            pass
+        running_autopost_tasks[owner_id].cancel()
         del running_autopost_tasks[owner_id]
-        logger.info(f"تم إيقاف محرك النشر القديم للمستخدم {owner_id}")
 
-    # 2. تشغيل المهمة الجديدة
-    config = await autopost_config_collection.find_one({"owner_id": owner_id})
-    if config and config.get('active', False):
+    configuration = await autopost_config_collection.find_one({"owner_id": owner_id})
+    if configuration and configuration.get('active', False):
         new_task = asyncio.create_task(engine_autopost_loop(client, owner_id))
         running_autopost_tasks[owner_id] = new_task
-        logger.info(f"تم تشغيل محرك نشر جديد للمستخدم {owner_id}")
 
 # ==============================================================================
 #                               6. المعالجات (Handlers)
@@ -219,11 +150,9 @@ async def handle_auto_reply(client, event):
         cursor = replies_collection.find({"owner_id": client.owner_id})
         async for reply_doc in cursor:
             if reply_doc['keyword'] in user_text:
-                # التحقق من الوقت (Cooldown)
                 cooldown_key = (event.chat_id, event.sender_id, reply_doc['keyword'])
                 last_time = reply_cooldown_timestamps.get(cooldown_key, 0)
                 if time.time() - last_time < 600: return
-                
                 reply_cooldown_timestamps[cooldown_key] = time.time()
                 await event.reply(reply_doc['reply'])
                 return
@@ -242,7 +171,6 @@ async def handle_ai_chat(client, event):
                 client.cooldowns[event.chat_id] = time.time()
     except: pass
 
-# اشتراك آمن فقط (عند الرد عليك بكلمات حظر)
 async def handle_safe_forced_join(client, event):
     try:
         if not (event.is_reply or event.mentioned): return
@@ -277,30 +205,31 @@ async def handle_safe_forced_join(client, event):
                 except: pass
     except: pass
 
-# 🔥 تجميد النشر عند رد المشرف 🔥
+# 🔥 معالج تجميد النشر (الحساس) 🔥
 async def handle_admin_freeze_trigger(client, event):
     if not (event.is_group and event.is_reply): return
     try:
         my_info = await client.get_me()
         reply_msg = await event.get_reply_message()
         
-        # إذا الرد مو علي، اطلع
+        # إذا كان الرد علي أنا
         if reply_msg.sender_id != my_info.id: return
         
         sender = await event.get_sender()
         perms = await client.get_permissions(event.chat_id, sender)
         
-        # إذا كان أدمن
+        # إذا رد أدمن
         if perms.is_admin or perms.is_creator:
+            print(f"⛔ Admin Replied in {event.chat.title}, Freezing...")
             await paused_groups_collection.update_one(
                 {"owner_id": client.owner_id, "chat_id": event.chat_id},
-                {"$set": {"admin_id": sender.id}},
+                {"$set": {"admin_id": sender.id}}, 
                 upsert=True
             )
-            await client.send_message("me", f"⛔ **تم إيقاف النشر في الجروب:** {event.chat.title}\nالسبب: رد عليك المشرف.")
+            await client.send_message("me", f"⛔ **تم إيقاف النشر في:** {event.chat.title}\nالسبب: رد عليك المشرف.")
     except: pass
 
-# 🔥 فك التجميد عند رد المالك 🔥
+# 🔥 معالج فك التجميد 🔥
 async def handle_owner_resume_trigger(client, event):
     if not (event.is_group and event.is_reply): return
     try:
@@ -315,14 +244,13 @@ async def handle_owner_resume_trigger(client, event):
     except: pass
 
 # ==============================================================================
-#                               7. المحركات الخلفية (Engines)
+#                               7. المحركات الخلفية
 # ==============================================================================
 
 async def engine_autopost_loop(client, owner_id):
-    logger.info(f"بدء النشر للمستخدم {owner_id}")
+    logging.info(f"START AUTOPOST {owner_id}")
     while True:
         try:
-            # التحقق من الإلغاء
             try: asyncio.current_task().cancelled()
             except: pass
 
@@ -330,11 +258,10 @@ async def engine_autopost_loop(client, owner_id):
             if not config or not config.get('active', False): break
             
             for group_id in config['groups']:
-                # 1. هل الجروب مجمد؟
-                if await paused_groups_collection.find_one({"owner_id": owner_id, "chat_id": group_id}): 
-                    continue
+                # التحقق من التجميد
+                if await paused_groups_collection.find_one({"owner_id": owner_id, "chat_id": group_id}): continue
                 
-                # 2. هل المشرف متصل؟
+                # التحقق من الرادار
                 is_danger = False
                 async for admin_doc in admins_watch_collection.find({"owner_id": owner_id}):
                     try:
@@ -350,7 +277,6 @@ async def engine_autopost_loop(client, owner_id):
                         except: pass
                     await asyncio.sleep(300); continue
 
-                # 3. النشر
                 try:
                     sent_message = await client.send_message(int(group_id), config['message'])
                     last_published_message_ids[f"{owner_id}_{group_id}"] = sent_message.id
@@ -378,20 +304,45 @@ async def engine_auto_leave_channels(client, owner_id):
         except: pass
         await asyncio.sleep(3600)
 
-# 🔥 محرك البرودكاست المطور (يدعم الصور) 🔥
-async def engine_broadcast_sender(client, status_message, source_message_object):
+# 🔥🔥🔥 محرك البرودكاست المطور (يدعم الصور والملفات) 🔥🔥🔥
+async def engine_broadcast_sender(userbot_client, status_message, message_event):
     count_sent = 0
     try:
-        async for dialog in client.iter_dialogs():
+        # تحميل الوسائط إذا وجدت (لضمان وصولها من البوت لليوزربوت)
+        media_file = None
+        if message_event.media:
+            await status_message.edit("⏳ **جاري معالجة الوسائط...**")
+            media_file = await message_event.download_media()
+        
+        text_content = message_event.text or ""
+
+        # البدء بالنشر
+        await status_message.edit("🚀 **بدأ النشر في الخاص...**")
+        
+        async for dialog in userbot_client.iter_dialogs():
             if dialog.is_user and not dialog.entity.bot:
                 try:
-                    # نرسل كائن الرسالة كاملاً (يدعم الصور والملفات)
-                    await client.send_message(dialog.id, source_message_object)
+                    if media_file:
+                        await userbot_client.send_message(dialog.id, text_content, file=media_file)
+                    else:
+                        await userbot_client.send_message(dialog.id, text_content)
+                    
                     count_sent += 1
-                    await asyncio.sleep(1)
+                    # تحديث العداد كل 5 رسائل
+                    if count_sent % 5 == 0:
+                        await status_message.edit(f"📤 تم الإرسال لـ: {count_sent}...")
+                    
+                    await asyncio.sleep(1) # منع الحظر
                 except: pass
-    except: pass
-    await status_message.edit(f"✅ **تم الانتهاء.**\nتم الإرسال لـ: `{count_sent}`")
+        
+        # تنظيف
+        if media_file and os.path.exists(media_file):
+            os.remove(media_file)
+
+    except Exception as e:
+        print(f"Broadcast Error: {e}")
+    
+    await status_message.edit(f"✅ **تم الانتهاء بنجاح.**\nعدد المستلمين: `{count_sent}`")
 
 async def engine_search_task(client, status_msg, hours, keyword, reply_text, delay):
     count = 0; limit_time = time.time() - (hours * 3600); replied_users = set()
@@ -412,13 +363,12 @@ async def engine_search_task(client, status_msg, hours, keyword, reply_text, del
     await status_msg.reply(f"✅ تم الرد على {count} رسالة.")
 
 # ==============================================================================
-#                               8. واجهة المستخدم (القوائم)
+#                               8. واجهة المستخدم
 # ==============================================================================
 
 @bot_client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     chat_id = event.chat_id
-    
     if chat_id in active_userbot_clients:
         config = await autopost_config_collection.find_one({"owner_id": chat_id})
         status_post = "🟢" if config and config.get('active') else "🔴"
@@ -434,13 +384,18 @@ async def start_handler(event):
     else:
         await event.respond("🔒", buttons=[[Button.inline("تسجيل الدخول", b"login")]])
 
+@bot_client.on(events.NewMessage(pattern='/cancel'))
+async def cancel_handler(event):
+    chat_id = event.chat_id
+    user_current_state[chat_id] = None
+    await event.respond("✅ **تم إلغاء العملية.**")
+
 @bot_client.on(events.CallbackQuery)
 async def callback_handler(event):
     chat_id = event.chat_id
     data = event.data
     client = active_userbot_clients.get(chat_id)
 
-    # 🔥 كاشف الصمت: تنبيه إذا لم يسجل الدخول 🔥
     if not client and data != b"login":
         await event.answer("⚠️ يجب تسجيل الدخول أولاً!", alert=True)
         return
@@ -487,7 +442,6 @@ async def callback_handler(event):
         if not conf:
             await event.respond("❌ قم بالإعداد أولاً")
             return
-        
         new_status = not conf.get('active', False)
         await autopost_config_collection.update_one({"owner_id": chat_id}, {"$set": {"active": new_status}}, upsert=True)
         await restart_autopost_task_safe(client, chat_id)
@@ -552,17 +506,18 @@ async def input_message_handler(event):
         else: await event.respond("❌ كود خطأ.")
         user_current_state[chat_id]=None
 
-    # برودكاست (الآن يدعم الصور)
+    # 🔥🔥🔥 معالج البرودكاست المطور 🔥🔥🔥
     elif state == "WAITING_BROADCAST_MSG":
-        status_msg = await event.respond("⏳ **جاري النشر...**")
-        asyncio.create_task(engine_broadcast_sender(active_userbot_clients[chat_id], status_msg, event.message))
+        status_msg = await event.respond("⏳ **جاري التحضير...**")
+        # نرسل الـ event كاملاً لدعم الصور
+        asyncio.create_task(engine_broadcast_sender(active_userbot_clients[chat_id], status_msg, event))
         user_current_state[chat_id] = None
 
     # إعدادات النشر
     elif state == "WAITING_POST_MSG":
         temporary_autopost_config[chat_id] = {'msg': user_text}
         user_current_state[chat_id] = "WAITING_POST_TIME"
-        await event.respond("✅ **تم حفظ النص.**\nأرسل الآن: **كم دقيقة الانتظار؟**")
+        await event.respond("✅ **تم حفظ النص.**\nالآن أرسل: **كم دقيقة الانتظار؟**")
     
     elif state == "WAITING_POST_TIME":
         try:
@@ -622,9 +577,6 @@ async def save_autopost_final(event):
     await event.respond("✅ **تم الحفظ وبدء النشر!**")
     user_current_state[chat_id] = None
 
-# ==============================================================================
-#                               9. التشغيل
-# ==============================================================================
 async def main():
     await start_web_server()
     await load_all_sessions_from_db()
