@@ -7,53 +7,97 @@ import re
 import traceback
 from datetime import datetime
 
-# استيراد المكتبات
+# ==============================================================================
+#                               استيراد المكتبات (كاملة)
+# ==============================================================================
+
+# للتعامل مع معرفات قاعدة البيانات
 from bson.objectid import ObjectId
+
+# محرك قاعدة البيانات
 from motor.motor_asyncio import AsyncIOMotorClient
+
+# مكتبة تيليجرام (Telethon)
 from telethon import TelegramClient, events, Button, functions, types
 from telethon.sessions import StringSession
 from telethon.tl.types import UserStatusOnline, UserStatusRecently
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
 from telethon.errors import FloodWaitError
+
+# خادم الويب (لإبقاء البوت نشطاً)
 from aiohttp import web
+
+# الذكاء الاصطناعي
 from openai import AsyncOpenAI
+
+# تحميل متغيرات البيئة
 from dotenv import load_dotenv
 
 # ==============================================================================
 #                               1. إعدادات النظام
 # ==============================================================================
-load_dotenv()
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger("SaudiMerchantBot_Debug")
 
-API_ID = int(os.getenv("API_ID") or 0)
+# تحميل ملف .env
+load_dotenv()
+
+# إعداد السجلات (Logging)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger("SaudiMerchantBot_Full_NoShortcuts")
+
+# جلب المتغيرات
+API_ID_RAW = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 SAMBANOVA_API_KEY = os.getenv("SAMBANOVA_API_KEY", "key")
 
-if not all([API_ID, API_HASH, BOT_TOKEN, MONGO_URI]):
+# التحقق من المتغيرات
+if not all([API_ID_RAW, API_HASH, BOT_TOKEN, MONGO_URI]):
+    logger.critical("❌ خطأ: البيانات ناقصة في ملف .env")
     sys.exit(1)
 
-# إعداد الذكاء
+API_ID = int(API_ID_RAW)
+
+# إعداد عميل الذكاء الاصطناعي
 try:
-    ai_client = AsyncOpenAI(base_url="https://api.sambanova.ai/v1", api_key=SAMBANOVA_API_KEY)
+    ai_client = AsyncOpenAI(
+        base_url="https://api.sambanova.ai/v1",
+        api_key=SAMBANOVA_API_KEY
+    )
     AI_MODEL = "Meta-Llama-3.1-405B-Instruct"
-except: ai_client = None
+except Exception as e:
+    ai_client = None
 
 STRICT_RULE = "أنت تاجر سعودي محترف."
 
 # ==============================================================================
-#                               2. الذاكرة
+#                               2. متغيرات الذاكرة (بدون اختصارات)
 # ==============================================================================
+
+# قائمة العملاء النشطين (Userbots)
 active_userbot_clients = {}
+
+# حالة المستخدم الحالية (لإدخال البيانات)
 user_current_state = {}
+
+# بيانات المهام المؤقتة
 temporary_task_data = {}
+
+# إعدادات النشر المؤقتة
 temporary_autopost_config = {}
+
+# آيدي آخر رسالة تم نشرها (للحذف عند الخطر)
 last_published_message_ids = {}
+
+# توقيت الردود (لمنع التكرار)
 reply_cooldown_timestamps = {}
-running_autopost_tasks = {} 
+
+# 🔥 قائمة المهام النشطة (لمنع التكرار) 🔥
+running_autopost_tasks = {} # {owner_id: asyncio.Task}
 
 # ==============================================================================
 #                               3. قاعدة البيانات
@@ -61,6 +105,7 @@ running_autopost_tasks = {}
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URI)
     database = mongo_client['MyTelegramBotDB']
+    
     sessions_collection = database['sessions']
     replies_collection = database['replies']
     ai_settings_collection = database['ai_prompts']
@@ -69,16 +114,19 @@ try:
     admins_watch_collection = database['admins_watch']
     subscriptions_collection = database['subscriptions']
     general_settings_collection = database['general_settings']
-    print("✅ DB Connected")
-except: sys.exit(1)
+    
+    print("✅ تم الاتصال بقاعدة البيانات بنجاح")
+except Exception as e:
+    logger.critical(f"DB Error: {e}")
+    sys.exit(1)
 
 # ==============================================================================
-#                               4. الخادم
+#                               4. الخادم والبوت
 # ==============================================================================
 bot_client = TelegramClient('bot_session', API_ID, API_HASH)
 
 async def web_request_handler(request):
-    return web.Response(text="Bot Running")
+    return web.Response(text="Bot Running OK")
 
 async def start_web_server():
     app = web.Application()
@@ -91,27 +139,34 @@ async def start_web_server():
 async def get_ai_response(messages_list):
     if not ai_client: return None
     try:
-        response = await ai_client.chat.completions.create(model=AI_MODEL, messages=messages_list, temperature=0.7)
+        response = await ai_client.chat.completions.create(
+            model=AI_MODEL,
+            messages=messages_list,
+            temperature=0.7
+        )
         return response.choices[0].message.content
     except: return None
 
 # ==============================================================================
-#                               5. إدارة اليوزربوت
+#                               5. إدارة اليوزربوت (Core Logic)
 # ==============================================================================
 
 async def start_userbot_session(owner_id, session_string):
     try:
+        # إغلاق الجلسة السابقة
         if owner_id in active_userbot_clients:
             await active_userbot_clients[owner_id].disconnect()
         
         userbot = TelegramClient(StringSession(session_string), API_ID, API_HASH)
         await userbot.connect()
-        if not await userbot.is_user_authorized(): return False
+        
+        if not await userbot.is_user_authorized():
+            return False
         
         userbot.owner_id = owner_id
         userbot.cooldowns = {} 
 
-        # تسجيل المعالجات
+        # --- تسجيل جميع المعالجات (Handlers) ---
         userbot.add_event_handler(lambda e: handle_auto_reply(userbot, e), events.NewMessage(incoming=True))
         userbot.add_event_handler(lambda e: handle_ai_chat(userbot, e), events.NewMessage(incoming=True))
         userbot.add_event_handler(lambda e: handle_safe_forced_join(userbot, e), events.NewMessage(incoming=True))
@@ -120,7 +175,10 @@ async def start_userbot_session(owner_id, session_string):
         
         active_userbot_clients[owner_id] = userbot
         
+        # استعادة المهام (مع الحماية)
         await restart_autopost_task_safe(userbot, owner_id)
+        
+        # تشغيل المغادرة التلقائية
         asyncio.create_task(engine_auto_leave_channels(userbot, owner_id))
             
         return True
@@ -130,18 +188,28 @@ async def load_all_sessions_from_db():
     async for document in sessions_collection.find({}):
         asyncio.create_task(start_userbot_session(document['_id'], document['session_string']))
 
+# 🔥 دالة منع التكرار (Task Killer) 🔥
 async def restart_autopost_task_safe(client, owner_id):
+    # 1. إيقاف المهمة القديمة
     if owner_id in running_autopost_tasks:
-        running_autopost_tasks[owner_id].cancel()
+        old_task = running_autopost_tasks[owner_id]
+        old_task.cancel()
+        try:
+            await old_task
+        except asyncio.CancelledError:
+            pass
         del running_autopost_tasks[owner_id]
+        logger.info(f"تم إيقاف محرك النشر القديم للمستخدم {owner_id}")
 
-    configuration = await autopost_config_collection.find_one({"owner_id": owner_id})
-    if configuration and configuration.get('active', False):
+    # 2. تشغيل المهمة الجديدة
+    config = await autopost_config_collection.find_one({"owner_id": owner_id})
+    if config and config.get('active', False):
         new_task = asyncio.create_task(engine_autopost_loop(client, owner_id))
         running_autopost_tasks[owner_id] = new_task
+        logger.info(f"تم تشغيل محرك نشر جديد للمستخدم {owner_id}")
 
 # ==============================================================================
-#                               6. المعالجات
+#                               6. المعالجات (Handlers)
 # ==============================================================================
 
 async def handle_auto_reply(client, event):
@@ -151,9 +219,11 @@ async def handle_auto_reply(client, event):
         cursor = replies_collection.find({"owner_id": client.owner_id})
         async for reply_doc in cursor:
             if reply_doc['keyword'] in user_text:
+                # التحقق من الوقت (Cooldown)
                 cooldown_key = (event.chat_id, event.sender_id, reply_doc['keyword'])
                 last_time = reply_cooldown_timestamps.get(cooldown_key, 0)
                 if time.time() - last_time < 600: return
+                
                 reply_cooldown_timestamps[cooldown_key] = time.time()
                 await event.reply(reply_doc['reply'])
                 return
@@ -172,6 +242,7 @@ async def handle_ai_chat(client, event):
                 client.cooldowns[event.chat_id] = time.time()
     except: pass
 
+# اشتراك آمن فقط (عند الرد عليك بكلمات حظر)
 async def handle_safe_forced_join(client, event):
     try:
         if not (event.is_reply or event.mentioned): return
@@ -196,45 +267,62 @@ async def handle_safe_forced_join(client, event):
                     if "+" in clean_link: await client(ImportChatInviteRequest(clean_link.split("+")[-1]))
                     else: await client(JoinChannelRequest(clean_link))
                     
-                    try: e = await client.get_entity(clean_link); cid = e.id
-                    except: cid = clean_link
-                    await subscriptions_collection.update_one({"owner_id": client.owner_id, "chat_id": cid}, 
+                    try: 
+                        entity = await client.get_entity(clean_link)
+                        chat_id_to_save = entity.id
+                    except: chat_id_to_save = clean_link
+                        
+                    await subscriptions_collection.update_one({"owner_id": client.owner_id, "chat_id": chat_id_to_save}, 
                         {"$set": {"join_time": time.time()}}, upsert=True)
                 except: pass
     except: pass
 
+# 🔥 تجميد النشر عند رد المشرف 🔥
 async def handle_admin_freeze_trigger(client, event):
     if not (event.is_group and event.is_reply): return
     try:
         my_info = await client.get_me()
-        if (await event.get_reply_message()).sender_id != my_info.id: return
+        reply_msg = await event.get_reply_message()
+        
+        # إذا الرد مو علي، اطلع
+        if reply_msg.sender_id != my_info.id: return
+        
         sender = await event.get_sender()
         perms = await client.get_permissions(event.chat_id, sender)
+        
+        # إذا كان أدمن
         if perms.is_admin or perms.is_creator:
-            await paused_groups_collection.update_one({"owner_id": client.owner_id, "chat_id": event.chat_id},
-                {"$set": {"admin_id": sender.id}}, upsert=True)
-            await client.send_message("me", f"⛔ توقف النشر في {event.chat.title}")
+            await paused_groups_collection.update_one(
+                {"owner_id": client.owner_id, "chat_id": event.chat_id},
+                {"$set": {"admin_id": sender.id}},
+                upsert=True
+            )
+            await client.send_message("me", f"⛔ **تم إيقاف النشر في الجروب:** {event.chat.title}\nالسبب: رد عليك المشرف.")
     except: pass
 
+# 🔥 فك التجميد عند رد المالك 🔥
 async def handle_owner_resume_trigger(client, event):
     if not (event.is_group and event.is_reply): return
     try:
         paused_data = await paused_groups_collection.find_one({"owner_id": client.owner_id, "chat_id": event.chat_id})
         if not paused_data: return
+        
         replied_to_msg = await event.get_reply_message()
+        # إذا رديت على نفس الأدمن
         if replied_to_msg.sender_id == paused_data['admin_id']:
             await paused_groups_collection.delete_one({"_id": paused_data['_id']})
-            await client.send_message("me", f"✅ عاد النشر في {event.chat.title}")
+            await client.send_message("me", f"✅ **تم استئناف النشر في:** {event.chat.title}")
     except: pass
 
 # ==============================================================================
-#                               7. المحركات الخلفية
+#                               7. المحركات الخلفية (Engines)
 # ==============================================================================
 
 async def engine_autopost_loop(client, owner_id):
-    logging.info(f"START AUTOPOST {owner_id}")
+    logger.info(f"بدء النشر للمستخدم {owner_id}")
     while True:
         try:
+            # التحقق من الإلغاء
             try: asyncio.current_task().cancelled()
             except: pass
 
@@ -242,8 +330,11 @@ async def engine_autopost_loop(client, owner_id):
             if not config or not config.get('active', False): break
             
             for group_id in config['groups']:
-                if await paused_groups_collection.find_one({"owner_id": owner_id, "chat_id": group_id}): continue
+                # 1. هل الجروب مجمد؟
+                if await paused_groups_collection.find_one({"owner_id": owner_id, "chat_id": group_id}): 
+                    continue
                 
+                # 2. هل المشرف متصل؟
                 is_danger = False
                 async for admin_doc in admins_watch_collection.find({"owner_id": owner_id}):
                     try:
@@ -259,6 +350,7 @@ async def engine_autopost_loop(client, owner_id):
                         except: pass
                     await asyncio.sleep(300); continue
 
+                # 3. النشر
                 try:
                     sent_message = await client.send_message(int(group_id), config['message'])
                     last_published_message_ids[f"{owner_id}_{group_id}"] = sent_message.id
@@ -286,13 +378,15 @@ async def engine_auto_leave_channels(client, owner_id):
         except: pass
         await asyncio.sleep(3600)
 
-async def engine_broadcast_sender(client, status_message, broadcast_text):
+# 🔥 محرك البرودكاست المطور (يدعم الصور) 🔥
+async def engine_broadcast_sender(client, status_message, source_message_object):
     count_sent = 0
     try:
         async for dialog in client.iter_dialogs():
             if dialog.is_user and not dialog.entity.bot:
                 try:
-                    await client.send_message(dialog.id, broadcast_text)
+                    # نرسل كائن الرسالة كاملاً (يدعم الصور والملفات)
+                    await client.send_message(dialog.id, source_message_object)
                     count_sent += 1
                     await asyncio.sleep(1)
                 except: pass
@@ -318,19 +412,20 @@ async def engine_search_task(client, status_msg, hours, keyword, reply_text, del
     await status_msg.reply(f"✅ تم الرد على {count} رسالة.")
 
 # ==============================================================================
-#                               8. واجهة المستخدم
+#                               8. واجهة المستخدم (القوائم)
 # ==============================================================================
 
 @bot_client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     chat_id = event.chat_id
+    
     if chat_id in active_userbot_clients:
         config = await autopost_config_collection.find_one({"owner_id": chat_id})
         status_post = "🟢" if config and config.get('active') else "🔴"
         
         buttons = [
             [Button.inline(f"📢 النشر التلقائي {status_post}", b"menu_autopost")],
-            [Button.inline("📨 برودكاست (خاص)", b"broadcast_menu")],
+            [Button.inline("📨 برودكاست (صور/نص)", b"broadcast_menu")],
             [Button.inline("📋 الردود", b"list_replies"), Button.inline("👮 الرادار", b"menu_radar")],
             [Button.inline("🚀 مهام بحث", b"menu_tasks"), Button.inline("🤖 ذكاء", b"toggle_ai")],
             [Button.inline("📊 إحصائيات", b"view_stats"), Button.inline("🗑️ تنظيف القنوات", b"clean_channels")]
@@ -339,18 +434,13 @@ async def start_handler(event):
     else:
         await event.respond("🔒", buttons=[[Button.inline("تسجيل الدخول", b"login")]])
 
-@bot_client.on(events.NewMessage(pattern='/cancel'))
-async def cancel_handler(event):
-    chat_id = event.chat_id
-    user_current_state[chat_id] = None
-    await event.respond("✅ **تم إلغاء العملية الحالية.**")
-
 @bot_client.on(events.CallbackQuery)
 async def callback_handler(event):
     chat_id = event.chat_id
     data = event.data
     client = active_userbot_clients.get(chat_id)
 
+    # 🔥 كاشف الصمت: تنبيه إذا لم يسجل الدخول 🔥
     if not client and data != b"login":
         await event.answer("⚠️ يجب تسجيل الدخول أولاً!", alert=True)
         return
@@ -397,6 +487,7 @@ async def callback_handler(event):
         if not conf:
             await event.respond("❌ قم بالإعداد أولاً")
             return
+        
         new_status = not conf.get('active', False)
         await autopost_config_collection.update_one({"owner_id": chat_id}, {"$set": {"active": new_status}}, upsert=True)
         await restart_autopost_task_safe(client, chat_id)
@@ -404,7 +495,7 @@ async def callback_handler(event):
 
     elif data == b"broadcast_menu":
         user_current_state[chat_id] = "WAITING_BROADCAST_MSG"
-        await event.respond("📨 **أرسل رسالة البرودكاست للخاص:**")
+        await event.respond("📨 **أرسل الرسالة (صورة/فيديو/نص) التي تريد نشرها للخاص:**")
 
     elif data == b"list_replies":
         btns = []
@@ -448,10 +539,9 @@ async def callback_handler(event):
 async def input_message_handler(event):
     chat_id = event.chat_id
     user_text = event.text.strip()
-    
-    # 🛑 هنا الحل للمشكلة: التحقق من وجود حالة وتجاهل الأوامر 🛑
     state = user_current_state.get(chat_id)
-    if not state or user_text.startswith('/'): return
+    
+    if not state: return
 
     # تسجيل الدخول
     if state == "WAITING_SESSION":
@@ -462,19 +552,18 @@ async def input_message_handler(event):
         else: await event.respond("❌ كود خطأ.")
         user_current_state[chat_id]=None
 
-    # برودكاست
+    # برودكاست (الآن يدعم الصور)
     elif state == "WAITING_BROADCAST_MSG":
         status_msg = await event.respond("⏳ **جاري النشر...**")
-        asyncio.create_task(engine_broadcast_sender(active_userbot_clients[chat_id], status_msg, user_text))
+        asyncio.create_task(engine_broadcast_sender(active_userbot_clients[chat_id], status_msg, event.message))
         user_current_state[chat_id] = None
 
-    # إعدادات النشر (تم استلام الرسالة)
+    # إعدادات النشر
     elif state == "WAITING_POST_MSG":
         temporary_autopost_config[chat_id] = {'msg': user_text}
         user_current_state[chat_id] = "WAITING_POST_TIME"
-        await event.respond("✅ **تم حفظ النص.**\nالآن أرسل: **كم دقيقة الانتظار بين النشر؟**")
+        await event.respond("✅ **تم حفظ النص.**\nأرسل الآن: **كم دقيقة الانتظار؟**")
     
-    # إعدادات النشر (تم استلام الوقت)
     elif state == "WAITING_POST_TIME":
         try:
             temporary_autopost_config[chat_id]['time'] = int(user_text)
@@ -486,8 +575,8 @@ async def input_message_handler(event):
             btns.append([Button.inline("✅ حفظ وبدء", "save_autopost_final")])
             temporary_autopost_config[chat_id]['groups'] = []
             await event.respond("✅ **تم حفظ الوقت.**\n📂 **اختر الجروبات:**", buttons=btns)
-        except ValueError:
-            await event.respond("❌ **خطأ:** الرجاء إرسال رقم صحيح للدقائق.")
+        except: 
+            await event.respond("❌ أرسل رقماً صحيحاً.")
 
     elif state == "WAITING_REPLY_KEY":
         TASK_DATA[chat_id] = {'k': user_text}
@@ -533,10 +622,13 @@ async def save_autopost_final(event):
     await event.respond("✅ **تم الحفظ وبدء النشر!**")
     user_current_state[chat_id] = None
 
+# ==============================================================================
+#                               9. التشغيل
+# ==============================================================================
 async def main():
     await start_web_server()
     await load_all_sessions_from_db()
-    print("✅ Bot Started Final Full Verbose")
+    print("✅ Bot Started Final Full")
     await bot_client.start(bot_token=BOT_TOKEN)
     await bot_client.run_until_disconnected()
 
