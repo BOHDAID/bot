@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 # ==============================================================================
 load_dotenv()
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger("SaudiMerchantBot_Broadcast_Fixed")
+logger = logging.getLogger("SaudiMerchantBot_TaskFixed")
 
 API_ID = int(os.getenv("API_ID") or 0)
 API_HASH = os.getenv("API_HASH")
@@ -72,7 +72,7 @@ try:
 except: sys.exit(1)
 
 # ==============================================================================
-#                               4. الخادم والبوت
+#                               4. الخادم
 # ==============================================================================
 bot_client = TelegramClient('bot_session', API_ID, API_HASH)
 
@@ -140,7 +140,7 @@ async def restart_autopost_task_safe(client, owner_id):
         running_autopost_tasks[owner_id] = new_task
 
 # ==============================================================================
-#                               6. المعالجات (Handlers)
+#                               6. المعالجات
 # ==============================================================================
 
 async def handle_auto_reply(client, event):
@@ -205,42 +205,28 @@ async def handle_safe_forced_join(client, event):
                 except: pass
     except: pass
 
-# 🔥 معالج تجميد النشر (الحساس) 🔥
 async def handle_admin_freeze_trigger(client, event):
     if not (event.is_group and event.is_reply): return
     try:
         my_info = await client.get_me()
-        reply_msg = await event.get_reply_message()
-        
-        # إذا كان الرد علي أنا
-        if reply_msg.sender_id != my_info.id: return
-        
+        if (await event.get_reply_message()).sender_id != my_info.id: return
         sender = await event.get_sender()
         perms = await client.get_permissions(event.chat_id, sender)
-        
-        # إذا رد أدمن
         if perms.is_admin or perms.is_creator:
-            print(f"⛔ Admin Replied in {event.chat.title}, Freezing...")
-            await paused_groups_collection.update_one(
-                {"owner_id": client.owner_id, "chat_id": event.chat_id},
-                {"$set": {"admin_id": sender.id}}, 
-                upsert=True
-            )
-            await client.send_message("me", f"⛔ **تم إيقاف النشر في:** {event.chat.title}\nالسبب: رد عليك المشرف.")
+            await paused_groups_collection.update_one({"owner_id": client.owner_id, "chat_id": event.chat_id},
+                {"$set": {"admin_id": sender.id}}, upsert=True)
+            await client.send_message("me", f"⛔ توقف النشر في {event.chat.title} بسبب رد المشرف.")
     except: pass
 
-# 🔥 معالج فك التجميد 🔥
 async def handle_owner_resume_trigger(client, event):
     if not (event.is_group and event.is_reply): return
     try:
         paused_data = await paused_groups_collection.find_one({"owner_id": client.owner_id, "chat_id": event.chat_id})
         if not paused_data: return
-        
         replied_to_msg = await event.get_reply_message()
-        # إذا رديت على نفس الأدمن
         if replied_to_msg.sender_id == paused_data['admin_id']:
             await paused_groups_collection.delete_one({"_id": paused_data['_id']})
-            await client.send_message("me", f"✅ **تم استئناف النشر في:** {event.chat.title}")
+            await client.send_message("me", f"✅ عاد النشر في {event.chat.title}")
     except: pass
 
 # ==============================================================================
@@ -258,10 +244,8 @@ async def engine_autopost_loop(client, owner_id):
             if not config or not config.get('active', False): break
             
             for group_id in config['groups']:
-                # التحقق من التجميد
                 if await paused_groups_collection.find_one({"owner_id": owner_id, "chat_id": group_id}): continue
                 
-                # التحقق من الرادار
                 is_danger = False
                 async for admin_doc in admins_watch_collection.find({"owner_id": owner_id}):
                     try:
@@ -293,7 +277,7 @@ async def engine_auto_leave_channels(client, owner_id):
         try:
             current_timestamp = time.time()
             async for sub in subscriptions_collection.find({"owner_id": owner_id}):
-                if current_timestamp - sub['join_time'] > 86400:
+                if current_timestamp - sub['join_time'] > 86400: # 24 ساعة
                     try:
                         target_id = sub['chat_id']
                         try: target_id = int(target_id)
@@ -304,63 +288,91 @@ async def engine_auto_leave_channels(client, owner_id):
         except: pass
         await asyncio.sleep(3600)
 
-# 🔥🔥🔥 محرك البرودكاست المطور (يدعم الصور والملفات) 🔥🔥🔥
-async def engine_broadcast_sender(userbot_client, status_message, message_event):
+async def engine_broadcast_sender(client, status_message, message_event):
     count_sent = 0
     try:
-        # تحميل الوسائط إذا وجدت (لضمان وصولها من البوت لليوزربوت)
+        # تحميل الملف (صورة/فيديو) إذا وجد
         media_file = None
         if message_event.media:
-            await status_message.edit("⏳ **جاري معالجة الوسائط...**")
+            await status_message.edit("⏳ **جاري تحميل الوسائط...**")
             media_file = await message_event.download_media()
         
         text_content = message_event.text or ""
-
-        # البدء بالنشر
+        
         await status_message.edit("🚀 **بدأ النشر في الخاص...**")
         
-        async for dialog in userbot_client.iter_dialogs():
+        async for dialog in client.iter_dialogs():
             if dialog.is_user and not dialog.entity.bot:
                 try:
+                    # الإرسال
                     if media_file:
-                        await userbot_client.send_message(dialog.id, text_content, file=media_file)
+                        await client.send_message(dialog.id, text_content, file=media_file)
                     else:
-                        await userbot_client.send_message(dialog.id, text_content)
+                        await client.send_message(dialog.id, text_content)
                     
                     count_sent += 1
-                    # تحديث العداد كل 5 رسائل
-                    if count_sent % 5 == 0:
+                    if count_sent % 10 == 0:
                         await status_message.edit(f"📤 تم الإرسال لـ: {count_sent}...")
                     
-                    await asyncio.sleep(1) # منع الحظر
+                    await asyncio.sleep(1)
                 except: pass
         
-        # تنظيف
+        # تنظيف الملف
         if media_file and os.path.exists(media_file):
             os.remove(media_file)
 
     except Exception as e:
-        print(f"Broadcast Error: {e}")
-    
-    await status_message.edit(f"✅ **تم الانتهاء بنجاح.**\nعدد المستلمين: `{count_sent}`")
+        print(f"BC Error: {e}")
+        
+    await status_message.edit(f"✅ **تم الانتهاء.**\nتم الإرسال لـ: `{count_sent}`")
 
-async def engine_search_task(client, status_msg, hours, keyword, reply_text, delay):
-    count = 0; limit_time = time.time() - (hours * 3600); replied_users = set()
+# 🔥🔥🔥 محرك البحث المصلح (يعطيك حالة مباشرة) 🔥🔥🔥
+async def engine_search_task(client, status_msg, hours, keyword, reply_msg_object, delay):
+    count = 0
+    limit_time = time.time() - (hours * 3600)
+    replied_users = set()
+    
     try:
         my_info = await client.get_me()
+        
+        # تحميل الرد إذا كان ميديا
+        reply_file = None
+        if reply_msg_object.media:
+            await status_msg.edit("⏳ **جاري تحضير ملف الرد...**")
+            reply_file = await reply_msg_object.download_media()
+        reply_text = reply_msg_object.text or ""
+
+        await status_msg.edit(f"🚀 **بدأ البحث عن:** `{keyword}`...")
+
         async for dialog in client.iter_dialogs():
             if dialog.is_group:
-                async for msg in client.iter_messages(dialog.id, search=keyword, limit=20):
-                    if msg.date.timestamp() > limit_time and msg.sender_id != my_info.id:
-                        if msg.sender_id in replied_users: continue
-                        try:
-                            await client.send_message(dialog.id, reply_text, reply_to=msg.id)
-                            replied_users.add(msg.sender_id)
-                            count += 1
-                            await asyncio.sleep(delay)
-                        except: pass
-    except: pass
-    await status_msg.reply(f"✅ تم الرد على {count} رسالة.")
+                # تحديث الحالة كل فترة عشان تعرف أنه شغال
+                await status_msg.edit(f"🔎 جاري البحث في: **{dialog.name}**...")
+                
+                try:
+                    async for msg in client.iter_messages(dialog.id, search=keyword, limit=10):
+                        if msg.date.timestamp() > limit_time and msg.sender_id != my_info.id:
+                            if msg.sender_id in replied_users: continue
+                            
+                            try:
+                                if reply_file:
+                                    await client.send_message(dialog.id, reply_text, file=reply_file, reply_to=msg.id)
+                                else:
+                                    await client.send_message(dialog.id, reply_text, reply_to=msg.id)
+                                
+                                replied_users.add(msg.sender_id)
+                                count += 1
+                                await asyncio.sleep(delay)
+                            except: pass
+                except: pass
+        
+        if reply_file and os.path.exists(reply_file):
+            os.remove(reply_file)
+
+    except Exception as e:
+        print(f"Task Error: {e}")
+        
+    await status_msg.respond(f"✅ **اكتملت المهمة!**\nتم الرد على: `{count}` رسالة.")
 
 # ==============================================================================
 #                               8. واجهة المستخدم
@@ -506,11 +518,10 @@ async def input_message_handler(event):
         else: await event.respond("❌ كود خطأ.")
         user_current_state[chat_id]=None
 
-    # 🔥🔥🔥 معالج البرودكاست المطور 🔥🔥🔥
+    # برودكاست (الآن يدعم الصور)
     elif state == "WAITING_BROADCAST_MSG":
-        status_msg = await event.respond("⏳ **جاري التحضير...**")
-        # نرسل الـ event كاملاً لدعم الصور
-        asyncio.create_task(engine_broadcast_sender(active_userbot_clients[chat_id], status_msg, event))
+        status_msg = await event.respond("⏳ **جاري النشر...**")
+        asyncio.create_task(engine_broadcast_sender(active_userbot_clients[chat_id], status_msg, event.message))
         user_current_state[chat_id] = None
 
     # إعدادات النشر
@@ -549,9 +560,19 @@ async def input_message_handler(event):
         await admins_watch_collection.delete_one({"owner_id": chat_id, "username": user_text.replace("@","")})
         await event.respond("🗑️"); user_current_state[chat_id]=None
 
-    elif state == "WAITING_TASK_HOURS": TASK_DATA[chat_id]={'h':int(user_text)}; user_current_state[chat_id]="WAITING_TASK_KEY"; await event.respond("كلمة البحث:")
-    elif state == "WAITING_TASK_KEY": TASK_DATA[chat_id]['k']=user_text; user_current_state[chat_id]="WAITING_TASK_REP"; await event.respond("الرد:")
-    elif state == "WAITING_TASK_REP": TASK_DATA[chat_id]['r']=event.message; user_current_state[chat_id]="WAITING_TASK_DELAY"; await event.respond("ثواني الانتظار:")
+    # 🔥🔥🔥 إعداد المهام المصحح 🔥🔥🔥
+    elif state == "WAITING_TASK_HOURS": 
+        TASK_DATA[chat_id]={'h':int(user_text)}
+        user_current_state[chat_id]="WAITING_TASK_KEY"
+        await event.respond("🔎 **كلمة البحث:**")
+    elif state == "WAITING_TASK_KEY": 
+        TASK_DATA[chat_id]['k']=user_text
+        user_current_state[chat_id]="WAITING_TASK_REP"
+        await event.respond("📝 **أرسل الرد (صورة أو نص):**")
+    elif state == "WAITING_TASK_REP": 
+        TASK_DATA[chat_id]['r']=event.message # حفظ كامل الرسالة (صورة/نص)
+        user_current_state[chat_id]="WAITING_TASK_DELAY"
+        await event.respond("⏱️ **ثواني الانتظار بين الردود:**")
     elif state == "WAITING_TASK_DELAY":
         msg = await event.respond("🚀")
         asyncio.create_task(engine_search_task(active_userbot_clients[chat_id], msg, TASK_DATA[chat_id]['h'], TASK_DATA[chat_id]['k'], TASK_DATA[chat_id]['r'], int(user_text)))
@@ -580,7 +601,7 @@ async def save_autopost_final(event):
 async def main():
     await start_web_server()
     await load_all_sessions_from_db()
-    print("✅ Bot Started Final Full")
+    print("✅ Bot Started Final Fixed V2")
     await bot_client.start(bot_token=BOT_TOKEN)
     await bot_client.run_until_disconnected()
 
