@@ -16,7 +16,7 @@ from telethon.tl.types import UserStatusOnline, UserStatusRecently
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
 from telethon.errors import FloodWaitError
-from telethon.extensions import html # ✨ إضافة مكتبة تحويل التنسيقات للحفاظ على إيموجي البريميوم
+from telethon.extensions import html # مكتبة تحويل التنسيقات للحفاظ على إيموجي البريميوم
 from aiohttp import web
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
@@ -35,6 +35,7 @@ MONGO_URI = os.getenv("MONGO_URI")
 SAMBANOVA_API_KEY = os.getenv("SAMBANOVA_API_KEY", "key")
 
 if not all([API_ID, API_HASH, BOT_TOKEN, MONGO_URI]):
+    print("⚠️ خطأ: بعض المتغيرات البيئية مفقودة (API_ID, API_HASH, BOT_TOKEN, MONGO_URI)")
     sys.exit(1)
 
 try:
@@ -71,10 +72,12 @@ try:
     subscriptions_collection = database['subscriptions']
     
     print("✅ DB Connected & Ready")
-except: sys.exit(1)
+except Exception as e: 
+    print(f"❌ DB Connection Error: {e}")
+    sys.exit(1)
 
 # ==============================================================================
-#                               4. الخادم
+#                               4. الخادم (التعديل الخاص بالاستضافة)
 # ==============================================================================
 bot_client = TelegramClient('bot_session', API_ID, API_HASH)
 
@@ -86,8 +89,13 @@ async def start_web_server():
     app.router.add_get('/', web_request_handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    
+    # سحب المنفذ من الاستضافة، وإذا لم يوجد نستخدم 8080 افتراضياً
+    port = int(os.environ.get("PORT", 8080))
+    
+    site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
+    print(f"✅ Web server started successfully on port {port}")
 
 async def get_ai_response(messages_list):
     if not ai_client: return None
@@ -277,7 +285,7 @@ async def engine_autopost_loop(client, owner_id):
                     await asyncio.sleep(300); continue
 
                 try:
-                    # ✨ التعديل هنا: قمنا بإضافة parse_mode='html' لكي يتم تفعيل إيموجي البريميوم
+                    # إضافة parse_mode='html' لكي يتم تفعيل إيموجي البريميوم
                     sent_message = await client.send_message(int(group_id), config['message'], parse_mode='html')
                     last_published_message_ids[f"{owner_id}_{group_id}"] = sent_message.id
                     await asyncio.sleep(5)
@@ -317,7 +325,7 @@ async def engine_broadcast_sender(client, status_message, message_event):
             await status_message.edit("⏳ **جاري معالجة الوسائط...**")
             media_file = await message_event.download_media()
         
-        # ✨ التعديل هنا: تحويل الرسالة لصيغة HTML مع الكيانات للحفاظ على التعبيرات المميزة
+        # تحويل الرسالة لصيغة HTML للحفاظ على التعبيرات المميزة
         text_content = html.unparse(message_event.raw_text, message_event.entities)
 
         await status_message.edit("🚀 **بدأ النشر...**")
@@ -325,7 +333,6 @@ async def engine_broadcast_sender(client, status_message, message_event):
         async for dialog in client.iter_dialogs():
             if dialog.is_user and not dialog.entity.bot:
                 try:
-                    # ✨ التعديل هنا: إضافة parse_mode='html'
                     if media_file:
                         await client.send_message(dialog.id, text_content, file=media_file, parse_mode='html')
                     else:
@@ -350,7 +357,7 @@ async def engine_search_task(client, status_msg, hours, keyword, reply_msg_objec
             await status_msg.edit("⏳ **تحميل الميديا...**")
             reply_file = await reply_msg_object.download_media()
             
-        # ✨ التعديل هنا: الحفاظ على الرموز المميزة في مهام البحث أيضاً
+        # الحفاظ على الرموز المميزة في مهام البحث
         reply_text = html.unparse(reply_msg_object.raw_text, reply_msg_object.entities)
 
         await status_msg.edit(f"🚀 **بدأ البحث...**")
@@ -362,7 +369,6 @@ async def engine_search_task(client, status_msg, hours, keyword, reply_msg_objec
                         if msg.date.timestamp() > limit_time and msg.sender_id != my_info.id:
                             if msg.sender_id in replied_users: continue
                             try:
-                                # ✨ التعديل هنا: parse_mode='html'
                                 if reply_file:
                                     await client.send_message(dialog.id, reply_text, file=reply_file, reply_to=msg.id, parse_mode='html')
                                 else:
@@ -427,7 +433,6 @@ async def callback_handler(event):
 
     elif data == b"menu_autopost":
         conf = await autopost_config_collection.find_one({"owner_id": chat_id})
-        msg_prev = conf.get('message', 'لا يوجد')[:20] if conf else "لا يوجد"
         btns = [
             [Button.inline("⚙️ إعداد جديد", b"setup_post")],
             [Button.inline("⏯️ تشغيل/إيقاف", b"toggle_post")],
@@ -525,7 +530,7 @@ async def input_message_handler(event):
         user_current_state[chat_id] = None
 
     elif state == "WAITING_POST_MSG":
-        # ✨ التعديل هنا: تحويل وحفظ الرسالة إلى HTML لضمان حفظ تعبيرات بريميوم في قاعدة البيانات
+        # تحويل وحفظ الرسالة إلى HTML لضمان حفظ تعبيرات بريميوم
         html_msg = html.unparse(event.message.raw_text, event.message.entities)
         temporary_autopost_config[chat_id] = {'msg': html_msg}
         
@@ -600,6 +605,11 @@ async def main():
     await bot_client.start(bot_token=BOT_TOKEN)
     await bot_client.run_until_disconnected()
 
+# الطريقة الحديثة والآمنة لتشغيل الكود في بيئات الاستضافة
 if __name__ == '__main__':
-    try: loop = asyncio.get_event_loop(); loop.run_until_complete(main())
-    except: pass
+    try: 
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Bot stopped manually.")
+    except Exception as e:
+        print(f"Fatal error: {e}")
